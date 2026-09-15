@@ -1,17 +1,33 @@
-# AI Market Decision Prototype — FIX
+# AI Market Decision V3
 
-Correzione del primo MVP. Il problema più probabile del primo pacchetto era legato a una versione vecchia di yfinance. Il progetto ora blocca `yfinance==1.7.0`, release del 26 agosto 2026, e usa `Ticker.history()` anziché il vecchio percorso `yf.download()`.
+Questa versione aggiunge al prototipo:
 
-## Installazione pulita Windows
+- DAY / WEEK / MONTH separati
+- piano operativo per ogni orizzonte
+- indicazione esplicita di **quando entrare** nel DAY
+- entry trigger, stop, target e risk/reward
+- ricalcolo automatico del DAY in Streamlit
+- scanner TOP BUY / TOP SELL per 3 orizzonti
+- accesso ai dati con `Ticker.history()` per maggiore robustezza rispetto al prototipo precedente
+- news per asset
+- nessun invio ordini al broker
 
-Nella cartella del progetto:
+## Avvio locale
 
-```cmd
+```bash
 python -m venv .venv
+# Windows
 .venv\Scripts\activate
-python -m pip install --upgrade pip
+# macOS/Linux
+source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Se avevi già una vecchia `.venv`, cancellala e ricreala.
+## Deploy
+
+Il progetto è pronto per essere caricato nello stesso repository GitHub usato per il deploy Streamlit.
+
+## Nota
+
+I segnali attuali sono ancora un motore quantitativo euristico. Per una versione da usare seriamente va aggiunto un dataset storico point-in-time, training ML, walk-forward validation, calibrazione delle probabilità, regime detection e backtest con costi/slippage.
