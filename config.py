@@ -1,4 +1,4 @@
-APP_NAME = "AI Market Decision V5"
+APP_NAME = "AI Market Decision V5.1"
 
 US_STOCKS = [
     "NVDA","AMD","AVGO","MSFT","AMZN","META","GOOGL","AAPL","TSLA","NFLX",
@@ -11,24 +11,10 @@ EU_STOCKS = [
 ]
 ETFS = ["QQQ","SPY","IWM","XLK","XLF","XLE","XLV","SMH","TLT","GLD","SLV"]
 
-ALL_UNIVERSE = list(dict.fromkeys(US_STOCKS + EU_STOCKS + ETFS))
-
 BENCHMARKS = {
     "SPY": "SPY",
     "QQQ": "QQQ",
     "VIX": "^VIX",
     "TNX": "^TNX",
-    "OIL": "CL=F",
-    "GOLD": "GC=F",
-    "BTC": "BTC-USD",
 }
-
-# Initial operating thresholds. They are configurable in the UI.
-DEFAULTS = {
-    "buy_prob": 0.65,
-    "sell_prob": 0.35,
-    "min_rr": 1.5,
-    "risk_pct": 0.01,
-    "capital": 10000.0,
-    "refresh_seconds": 300,
-}
+ALL_UNIVERSE = list(dict.fromkeys(US_STOCKS + EU_STOCKS + ETFS))
