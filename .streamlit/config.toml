@@ -1,0 +1,11 @@
+[theme]
+base = "dark"
+primaryColor = "#4F8BF9"
+
+[server]
+headless = true
+runOnSave = false
+maxUploadSize = 20
+
+[browser]
+gatherUsageStats = false
