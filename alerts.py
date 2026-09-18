@@ -3,13 +3,16 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-import requests
+try:
+    import requests
+except Exception:
+    requests = None
 
 
 def _secret(name: str) -> Optional[str]:
-    val = os.getenv(name)
-    if val:
-        return val
+    value = os.getenv(name)
+    if value:
+        return value
     try:
         import streamlit as st
         value = st.secrets.get(name)
@@ -18,17 +21,21 @@ def _secret(name: str) -> Optional[str]:
         return None
 
 
+def telegram_configured() -> bool:
+    return bool(_secret("TELEGRAM_BOT_TOKEN") and _secret("TELEGRAM_CHAT_ID"))
+
+
 def send_telegram(message: str) -> bool:
     token = _secret("TELEGRAM_BOT_TOKEN")
     chat_id = _secret("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
+    if not token or not chat_id or requests is None:
         return False
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
+            json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
             timeout=10,
         )
-        return response.ok
+        return bool(response.ok)
     except Exception:
         return False

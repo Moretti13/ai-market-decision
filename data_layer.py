@@ -1,30 +1,24 @@
 from __future__ import annotations
 
 import time as time_module
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+import threading
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
-from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
 
 try:
     import feedparser
 except Exception:
     feedparser = None
-import numpy as np
-import pandas as pd
+
 try:
     import yfinance as yf
 except Exception:
     yf = None
 
 from config import BENCHMARKS, MODEL_FEATURES
-
-NY = ZoneInfo("America/New_York")
-ROME = ZoneInfo("Europe/Rome")
-BERLIN = ZoneInfo("Europe/Berlin")
-PARIS = ZoneInfo("Europe/Paris")
-AMSTERDAM = ZoneInfo("Europe/Amsterdam")
-MADRID = ZoneInfo("Europe/Madrid")
 
 
 class DataError(RuntimeError):
@@ -50,64 +44,85 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_ohlcv(df: pd.DataFrame, daily: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = _flatten_columns(df)
-    idx = pd.to_datetime(out.index, errors="coerce")
-    valid = ~idx.isna()
+    original_index = pd.to_datetime(out.index, errors="coerce")
+    valid = ~original_index.isna()
     out = out.loc[valid].copy()
-    idx = idx[valid]
-    if getattr(idx, "tz", None) is None:
-        idx = idx.tz_localize("UTC")
+    original_index = original_index[valid]
+
+    if daily:
+        # Preserve the exchange calendar date before converting timezone. This avoids
+        # shifting European daily bars to the previous UTC date.
+        dates = [ts.date() for ts in original_index]
+        idx = pd.DatetimeIndex(pd.to_datetime(dates), tz="UTC")
     else:
-        idx = idx.tz_convert("UTC")
+        idx = original_index
+        if getattr(idx, "tz", None) is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
     out.index = idx
+
     keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in out.columns]
     out = out[keep]
-    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if col in out.columns:
-            out[col] = clean_numeric(out[col])
+    for col in keep:
+        out[col] = clean_numeric(out[col])
     if "Close" not in out.columns:
         return pd.DataFrame()
-    return out.sort_index().dropna(subset=["Close"])
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out.dropna(subset=["Close"])
 
 
 _CACHE: Dict[Tuple[str, str, str, bool], Tuple[float, pd.DataFrame]] = {}
-_CACHE_TTL = {
-    "1d": 300.0,
-    "5m": 30.0,
-    "15m": 60.0,
-    "1h": 120.0,
-}
+_CACHE_TTL = {"1d": 300.0, "5m": 35.0, "15m": 60.0, "30m": 90.0, "1h": 120.0}
 
 
-def fetch(ticker: str, period: str = "1y", interval: str = "1d", prepost: bool = False, force: bool = False) -> pd.DataFrame:
+def clear_cache() -> None:
+    global _BENCH_CACHE
+    _CACHE.clear()
+    _BENCH_CACHE = None
+
+
+def fetch(
+    ticker: str,
+    period: str = "1y",
+    interval: str = "1d",
+    prepost: bool = False,
+    force: bool = False,
+) -> pd.DataFrame:
     ticker = ticker.strip().upper()
+    if not ticker:
+        raise DataError("Ticker vuoto")
     key = (ticker, period, interval, prepost)
-    ttl = _CACHE_TTL.get(interval, 120.0)
     now = time_module.time()
-    if not force and key in _CACHE and (now - _CACHE[key][0] < ttl):
+    ttl = _CACHE_TTL.get(interval, 120.0)
+    if not force and key in _CACHE and now - _CACHE[key][0] < ttl:
         return _CACHE[key][1].copy()
-
     if yf is None:
-        raise DataError("yfinance non installato: installa requirements.txt")
+        raise DataError("yfinance non installato: esegui l'installazione da requirements.txt")
+
     errors: List[str] = []
-    try:
-        hist = yf.Ticker(ticker).history(
-            period=period,
-            interval=interval,
-            prepost=prepost,
-            auto_adjust=False,
-            actions=False,
-        )
-        out = normalize_ohlcv(hist)
-        if not out.empty:
-            _CACHE[key] = (now, out)
-            return out.copy()
-        errors.append("Ticker.history vuoto")
-    except Exception as exc:
-        errors.append(f"Ticker.history: {exc}")
+    for attempt in range(2):
+        try:
+            hist = yf.Ticker(ticker).history(
+                period=period,
+                interval=interval,
+                prepost=prepost,
+                auto_adjust=False,
+                actions=False,
+                timeout=15,
+            )
+            out = normalize_ohlcv(hist, daily=(interval == "1d"))
+            if not out.empty:
+                _CACHE[key] = (now, out)
+                return out.copy()
+            errors.append("Ticker.history vuoto")
+        except Exception as exc:
+            errors.append(f"Ticker.history[{attempt+1}]: {exc}")
+            time_module.sleep(0.15 * (attempt + 1))
 
     try:
         hist = yf.download(
@@ -119,16 +134,16 @@ def fetch(ticker: str, period: str = "1y", interval: str = "1d", prepost: bool =
             progress=False,
             threads=False,
             actions=False,
+            timeout=20,
         )
-        out = normalize_ohlcv(hist)
+        out = normalize_ohlcv(hist, daily=(interval == "1d"))
         if not out.empty:
             _CACHE[key] = (now, out)
             return out.copy()
         errors.append("yf.download vuoto")
     except Exception as exc:
         errors.append(f"yf.download: {exc}")
-
-    raise DataError(f"Dati non disponibili per {ticker}. {' | '.join(errors)}")
+    raise DataError(f"Dati non disponibili per {ticker}. {' | '.join(errors[-4:])}")
 
 
 def rsi(close: pd.Series, n: int = 14) -> pd.Series:
@@ -141,90 +156,109 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
 
 
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high = clean_numeric(df["High"])
-    low = clean_numeric(df["Low"])
-    close = clean_numeric(df["Close"])
+    high, low, close = clean_numeric(df["High"]), clean_numeric(df["Low"]), clean_numeric(df["Close"])
     prev_close = close.shift(1)
-    tr = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(n, min_periods=max(3, n // 3)).mean().bfill()
 
 
 def daily_features(df: pd.DataFrame) -> pd.DataFrame:
-    x = normalize_ohlcv(df)
-    if x.empty or len(x) < 30:
+    x = normalize_ohlcv(df, daily=True)
+    if x.empty or len(x) < 40:
         return pd.DataFrame()
     close = clean_numeric(x["Close"])
     ret = close.pct_change()
-    x["ret1"] = close.pct_change(1)
-    x["ret3"] = close.pct_change(3)
-    x["ret5"] = close.pct_change(5)
-    x["ret10"] = close.pct_change(10)
-    x["ret20"] = close.pct_change(20)
-    x["vol5"] = ret.rolling(5, min_periods=3).std()
-    x["vol20"] = ret.rolling(20, min_periods=10).std()
-    x["sma10"] = close.rolling(10, min_periods=5).mean()
-    x["sma20"] = close.rolling(20, min_periods=10).mean()
-    x["sma50"] = close.rolling(50, min_periods=20).mean()
-    x["sma200"] = close.rolling(200, min_periods=50).mean()
+    for n in [1, 3, 5, 10, 20, 60]:
+        x[f"ret{n}"] = close.pct_change(n)
+    for n in [5, 20, 60]:
+        x[f"vol{n}"] = ret.rolling(n, min_periods=max(3, n // 2)).std()
+
+    for n in [20, 50, 200]:
+        x[f"sma{n}"] = close.rolling(n, min_periods=max(10, n // 3)).mean()
+        x[f"dist_sma{n}"] = (close / x[f"sma{n}"] - 1).replace([np.inf, -np.inf], np.nan)
+    x["ema20"] = close.ewm(span=20, adjust=False).mean()
+    x["ema50"] = close.ewm(span=50, adjust=False).mean()
+    x["ema20_slope"] = x["ema20"].pct_change(5)
+    x["ema50_slope"] = x["ema50"].pct_change(10)
     x["rsi14"] = rsi(close)
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    x["macd"] = (ema12 - ema26) / close.replace(0, np.nan)
+    signal = (ema12 - ema26).ewm(span=9, adjust=False).mean()
+    x["macd_signal"] = signal / close.replace(0, np.nan)
+
+    mid = close.rolling(20, min_periods=10).mean()
+    std = close.rolling(20, min_periods=10).std().replace(0, np.nan)
+    x["bb_z"] = ((close - mid) / std).replace([np.inf, -np.inf], np.nan)
     x["atr14"] = atr(x)
     x["atr_pct"] = (x["atr14"] / close).replace([np.inf, -np.inf], np.nan)
+
     volume = clean_numeric(x.get("Volume", pd.Series(index=x.index, dtype=float))).fillna(0)
     vmean = volume.rolling(20, min_periods=5).mean()
     vstd = volume.rolling(20, min_periods=5).std().replace(0, np.nan)
-    x["volume_z"] = ((volume - vmean) / vstd).fillna(0)
-    x["dist_sma20"] = (close / x["sma20"] - 1).replace([np.inf, -np.inf], np.nan)
-    x["dist_sma50"] = (close / x["sma50"] - 1).replace([np.inf, -np.inf], np.nan)
+    x["volume_z"] = ((volume - vmean) / vstd).replace([np.inf, -np.inf], np.nan).fillna(0)
     x["range_pct"] = ((clean_numeric(x["High"]) - clean_numeric(x["Low"])) / close).replace([np.inf, -np.inf], np.nan)
     x["gap"] = (clean_numeric(x["Open"]) / close.shift(1) - 1).replace([np.inf, -np.inf], np.nan)
-    return x.replace([np.inf, -np.inf], np.nan).dropna(subset=["ret1", "vol20", "sma20", "rsi14", "atr_pct"])
+    rolling_high = clean_numeric(x["High"]).rolling(252, min_periods=60).max()
+    x["dist_52w_high"] = (close / rolling_high - 1).replace([np.inf, -np.inf], np.nan)
+
+    required = ["ret1", "ret20", "vol20", "rsi14", "atr_pct", "dist_sma20"]
+    return x.replace([np.inf, -np.inf], np.nan).dropna(subset=required)
+
+
+_BENCH_CACHE: Tuple[float, pd.DataFrame] | None = None
+_BENCH_LOCK = threading.Lock()
 
 
 def benchmark_features(start: pd.Timestamp, end: Optional[pd.Timestamp] = None) -> pd.DataFrame:
-    frames = []
-    for name, ticker in BENCHMARKS.items():
-        try:
-            raw = fetch(ticker, "3y", "1d")
-            d = daily_features(raw)
-            if d.empty:
-                continue
-            cols = d[["ret1", "ret5"]].rename(columns={"ret1": f"bench_{name.lower()}_ret1", "ret5": f"bench_{name.lower()}_ret5"})
-            if name in {"VIX", "TNX", "DXY", "OIL", "GOLD", "BTC"}:
-                cols = cols[[c for c in cols.columns if c.endswith("_ret1")]]
-            frames.append(cols)
-        except Exception:
-            continue
-    if not frames:
-        return pd.DataFrame(index=pd.date_range(start=start, end=end or start, freq="D"))
-    out = pd.concat(frames, axis=1).sort_index()
-    return out.loc[(out.index >= start) & (end is None or out.index <= end)].ffill().fillna(0)
+    global _BENCH_CACHE
+    now = time_module.time()
+    if _BENCH_CACHE is not None and now - _BENCH_CACHE[0] < 300:
+        full = _BENCH_CACHE[1]
+    else:
+        # Scanner threads share one benchmark build instead of hammering the provider.
+        with _BENCH_LOCK:
+            now = time_module.time()
+            if _BENCH_CACHE is not None and now - _BENCH_CACHE[0] < 300:
+                full = _BENCH_CACHE[1]
+            else:
+                frames = []
+                for name, ticker in BENCHMARKS.items():
+                    try:
+                        d = daily_features(fetch(ticker, "5y", "1d"))
+                        if d.empty:
+                            continue
+                        wanted = {"ret1": f"bench_{name.lower()}_ret1"}
+                        if name in {"SPY", "QQQ", "IWM"}:
+                            wanted["ret5"] = f"bench_{name.lower()}_ret5"
+                        cols = d[list(wanted)].rename(columns=wanted)
+                        frames.append(cols)
+                    except Exception:
+                        continue
+                full = pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+                _BENCH_CACHE = (now, full)
+    if full.empty:
+        return pd.DataFrame()
+    s = pd.Timestamp(start).tz_convert("UTC") if pd.Timestamp(start).tzinfo else pd.Timestamp(start, tz="UTC")
+    e0 = end if end is not None else full.index.max()
+    e = pd.Timestamp(e0).tz_convert("UTC") if pd.Timestamp(e0).tzinfo else pd.Timestamp(e0, tz="UTC")
+    return full.loc[(full.index >= s) & (full.index <= e)].copy()
 
 
 def add_market_features(d: pd.DataFrame) -> pd.DataFrame:
     if d.empty:
         return d
-    bench = benchmark_features(d.index.min(), d.index.max())
-    if bench.empty:
-        for feature in MODEL_FEATURES:
-            if feature.startswith("bench_"):
-                d[feature] = 0.0
-        return d
     out = d.copy()
-    aligned = bench.reindex(out.index).ffill().fillna(0)
-    for col in aligned.columns:
-        out[col] = aligned[col]
-    required_bench = [c for c in MODEL_FEATURES if c.startswith("bench_")]
-    for col in required_bench:
-        if col not in out:
+    bench = benchmark_features(out.index.min(), out.index.max())
+    if not bench.empty:
+        aligned = bench.reindex(out.index).ffill().fillna(0)
+        for col in aligned.columns:
+            out[col] = aligned[col]
+    for col in [c for c in MODEL_FEATURES if c.startswith("bench_")]:
+        if col not in out.columns:
             out[col] = 0.0
     return out
-
-
-def latest_previous_close(ticker: str) -> float:
-    d = daily_features(fetch(ticker, "6mo", "1d"))
-    return safe_float(d["Close"].iloc[-1])
 
 
 def regular_session_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
@@ -234,16 +268,18 @@ def regular_session_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     tz, (op, cl) = session_hours(ticker)
     local = df.index.tz_convert(tz)
     minutes = local.hour * 60 + local.minute
-    opm = op.hour * 60 + op.minute
-    clm = cl.hour * 60 + cl.minute
+    opm, clm = op.hour * 60 + op.minute, cl.hour * 60 + cl.minute
     return df.loc[(minutes >= opm) & (minutes < clm)].copy()
 
 
 def premarket_df(ticker: str) -> pd.DataFrame:
+    from market_clock import NY, session_hours
     tz, _ = session_hours(ticker)
     if tz != NY:
         return pd.DataFrame()
-    df = fetch(ticker, "3d", "5m", prepost=True)
+    df = fetch(ticker, "5d", "5m", prepost=True)
+    if df.empty:
+        return df
     local = df.index.tz_convert(NY)
     minutes = local.hour * 60 + local.minute
     return df.loc[(minutes >= 240) & (minutes < 570)].copy()
@@ -254,38 +290,40 @@ def latest_regular(ticker: str) -> pd.DataFrame:
 
 
 def intraday_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    from market_clock import session_hours
     if df.empty:
         return pd.DataFrame()
-    x = normalize_ohlcv(df)
-    x = regular_session_df(x, ticker)
+    x = regular_session_df(normalize_ohlcv(df), ticker)
     if x.empty:
         return x
+    tz, _ = session_hours(ticker)
     close = clean_numeric(x["Close"])
     volume = clean_numeric(x.get("Volume", pd.Series(index=x.index, dtype=float))).fillna(0)
-    x["ret5m"] = close.pct_change(1)
-    x["ret15m"] = close.pct_change(3)
-    x["ret30m"] = close.pct_change(6)
-    x["ret60m"] = close.pct_change(12)
-    pv = (close * volume).groupby(x.index.tz_convert(NY).date).cumsum()
-    vv = volume.groupby(x.index.tz_convert(NY).date).cumsum().replace(0, np.nan)
+    for bars, name in [(1, "ret5m"), (3, "ret15m"), (6, "ret30m"), (12, "ret60m")]:
+        x[name] = close.pct_change(bars)
+    local_dates = x.index.tz_convert(tz).date
+    pv = (close * volume).groupby(local_dates).cumsum()
+    vv = volume.groupby(local_dates).cumsum().replace(0, np.nan)
     x["vwap"] = (pv / vv).fillna(close)
     x["vwap_dist"] = (close / x["vwap"] - 1).replace([np.inf, -np.inf], np.nan).fillna(0)
-    x["range"] = (clean_numeric(x["High"]) - clean_numeric(x["Low"]))
     vm = volume.rolling(20, min_periods=5).mean().replace(0, np.nan)
     x["volume_ratio"] = (volume / vm).replace([np.inf, -np.inf], np.nan).fillna(1)
-    dates = x.index.tz_convert(NY).date
-    x["session_date"] = dates
+    x["session_date"] = local_dates
     x["bar_num"] = x.groupby("session_date").cumcount() + 1
-    or_high = x.groupby("session_date")["High"].transform(lambda s: safe_float(s.head(6).max(), np.nan))
-    or_low = x.groupby("session_date")["Low"].transform(lambda s: safe_float(s.head(6).min(), np.nan))
-    x["or_high"] = or_high
-    x["or_low"] = or_low
+    x["session_open"] = x.groupby("session_date")["Open"].transform("first")
+    x["session_ret"] = (close / x["session_open"] - 1).replace([np.inf, -np.inf], np.nan).fillna(0)
+    x["session_high"] = x.groupby("session_date")["High"].cummax()
+    x["session_low"] = x.groupby("session_date")["Low"].cummin()
+    x["or_high"] = x.groupby("session_date")["High"].transform(lambda s: s.iloc[:6].max())
+    x["or_low"] = x.groupby("session_date")["Low"].transform(lambda s: s.iloc[:6].min())
     denom = (x["or_high"] - x["or_low"]).replace(0, np.nan)
     x["or_pos"] = ((close - x["or_low"]) / denom).replace([np.inf, -np.inf], np.nan).fillna(0.5)
     return x.replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
-def news(ticker: str, limit: int = 12) -> List[Dict]:
+def raw_news(ticker: str, limit: int = 20) -> List[Dict]:
+    if yf is None:
+        return []
     results: List[Dict] = []
     try:
         items = yf.Ticker(ticker).news or []
@@ -295,10 +333,7 @@ def news(ticker: str, limit: int = 12) -> List[Dict]:
             provider = content.get("provider")
             publisher = (provider.get("displayName") if isinstance(provider, dict) else None) or item.get("publisher") or "Source"
             url_obj = content.get("clickThroughUrl")
-            if isinstance(url_obj, dict):
-                url = url_obj.get("url")
-            else:
-                url = item.get("link")
+            url = url_obj.get("url") if isinstance(url_obj, dict) else item.get("link")
             published = content.get("pubDate") or item.get("providerPublishTime") or item.get("published")
             results.append({"title": str(title), "publisher": str(publisher), "url": url, "published": published})
     except Exception:
@@ -311,34 +346,15 @@ def news(ticker: str, limit: int = 12) -> List[Dict]:
             for entry in feed.entries[: limit - len(results)]:
                 source = entry.get("source")
                 publisher = source.get("title") if hasattr(source, "get") else "Google News"
-                results.append({"title": entry.get("title", "News"), "publisher": publisher or "Google News", "url": entry.get("link"), "published": entry.get("published")})
+                results.append({
+                    "title": entry.get("title", "News"),
+                    "publisher": publisher or "Google News",
+                    "url": entry.get("link"),
+                    "published": entry.get("published"),
+                })
         except Exception:
             pass
     return results[:limit]
-
-
-def simple_sentiment(text: str) -> float:
-    positive = {
-        "beat", "beats", "strong", "growth", "upgrade", "surge", "profit", "record", "bullish",
-        "positive", "raises", "raise", "buyback", "outperform", "approval", "wins", "contract",
-    }
-    negative = {
-        "miss", "misses", "weak", "decline", "downgrade", "drop", "loss", "warning", "bearish",
-        "negative", "cuts", "cut", "sell", "lawsuit", "recall", "investigation", "tariff",
-    }
-    words = {w.strip(".,:;!?()[]{}\"").lower() for w in str(text).split()}
-    pos = sum(w in positive for w in words)
-    neg = sum(w in negative for w in words)
-    if pos + neg == 0:
-        return 0.0
-    return float((pos - neg) / (pos + neg))
-
-
-def news_context(ticker: str, limit: int = 12) -> Dict:
-    items = news(ticker, limit)
-    scores = [simple_sentiment(i.get("title", "")) for i in items]
-    score = float(np.mean(scores)) if scores else 0.0
-    return {"items": items, "sentiment": score, "count": len(items)}
 
 
 def current_fundamentals(ticker: str) -> Dict:
@@ -346,11 +362,13 @@ def current_fundamentals(ticker: str) -> Dict:
         "shortName", "sector", "industry", "marketCap", "trailingPE", "forwardPE", "pegRatio",
         "priceToSalesTrailing12Months", "returnOnEquity", "returnOnAssets", "profitMargins",
         "operatingMargins", "grossMargins", "debtToEquity", "revenueGrowth", "earningsGrowth",
-        "freeCashflow", "totalCash", "totalDebt", "dividendYield",
+        "freeCashflow", "totalCash", "totalDebt", "dividendYield", "averageVolume", "beta",
     ]
     out: Dict = {}
+    if yf is None:
+        return {"error": "yfinance non disponibile"}
     try:
-        info = yf.Ticker(ticker).get_info()
+        info = yf.Ticker(ticker).get_info() or {}
         for field in fields:
             val = info.get(field)
             if val is not None and val != "":
@@ -360,16 +378,78 @@ def current_fundamentals(ticker: str) -> Dict:
     return out
 
 
-def data_health(ticker: str) -> Dict:
-    health = {"ticker": ticker, "daily_bars": 0, "intraday_bars": 0, "premarket_bars": 0, "status": "UNKNOWN", "warnings": []}
+def earnings_context(ticker: str) -> Dict:
+    result = {"next_earnings": None, "days_to_earnings": None, "source": "Yahoo Finance"}
+    if yf is None:
+        return result
+    now = pd.Timestamp.now(tz="UTC")
     try:
-        daily = fetch(ticker, "2y", "1d")
+        cal = yf.Ticker(ticker).calendar
+        if isinstance(cal, dict):
+            candidates = cal.get("Earnings Date") or cal.get("EarningsDate")
+            if candidates is not None:
+                if not isinstance(candidates, (list, tuple)):
+                    candidates = [candidates]
+                parsed = [pd.to_datetime(x, utc=True, errors="coerce") for x in candidates]
+                parsed = [x for x in parsed if not pd.isna(x) and x >= now - pd.Timedelta(days=1)]
+                if parsed:
+                    nxt = min(parsed)
+                    result["next_earnings"] = nxt.isoformat()
+                    result["days_to_earnings"] = int(np.floor((nxt - now).total_seconds() / 86400))
+                    return result
+    except Exception:
+        pass
+    try:
+        dates = yf.Ticker(ticker).get_earnings_dates(limit=8)
+        if dates is not None and not dates.empty:
+            idx = pd.to_datetime(dates.index, utc=True, errors="coerce")
+            future = idx[idx >= now - pd.Timedelta(days=1)]
+            if len(future):
+                nxt = min(future)
+                result["next_earnings"] = nxt.isoformat()
+                result["days_to_earnings"] = int(np.floor((nxt - now).total_seconds() / 86400))
+    except Exception:
+        pass
+    return result
+
+
+def quote_snapshot(ticker: str) -> Dict:
+    from market_clock import market_status
+    status = market_status(ticker)
+    try:
+        intra = fetch(ticker, "5d", "5m", prepost=True)
+        if not intra.empty:
+            row = intra.iloc[-1]
+            return {"price": safe_float(row["Close"]), "asof": str(intra.index[-1]), "source": "5m", "market_status": status["status"]}
+    except Exception:
+        pass
+    daily = fetch(ticker, "1mo", "1d")
+    if daily.empty:
+        raise DataError(f"Nessun prezzo per {ticker}")
+    return {"price": safe_float(daily["Close"].iloc[-1]), "asof": str(daily.index[-1]), "source": "1d", "market_status": status["status"]}
+
+
+def data_health(ticker: str) -> Dict:
+    health = {
+        "ticker": ticker,
+        "daily_bars": 0,
+        "intraday_bars": 0,
+        "premarket_bars": 0,
+        "daily_last": None,
+        "intraday_last": None,
+        "status": "UNKNOWN",
+        "warnings": [],
+    }
+    try:
+        daily = fetch(ticker, "7y", "1d")
         health["daily_bars"] = len(daily)
+        health["daily_last"] = str(daily.index[-1]) if len(daily) else None
     except Exception as exc:
         health["warnings"].append(f"Daily: {exc}")
     try:
         intra = latest_regular(ticker)
         health["intraday_bars"] = len(intra)
+        health["intraday_last"] = str(intra.index[-1]) if len(intra) else None
     except Exception as exc:
         health["warnings"].append(f"Intraday: {exc}")
     try:
@@ -377,5 +457,10 @@ def data_health(ticker: str) -> Dict:
         health["premarket_bars"] = len(pre)
     except Exception as exc:
         health["warnings"].append(f"Premarket: {exc}")
-    health["status"] = "OK" if health["daily_bars"] >= 150 and not health["warnings"] else "PARTIAL" if health["daily_bars"] >= 60 else "ERROR"
+    if health["daily_bars"] >= 180 and not health["warnings"]:
+        health["status"] = "OK"
+    elif health["daily_bars"] >= 80:
+        health["status"] = "PARTIAL"
+    else:
+        health["status"] = "ERROR"
     return health

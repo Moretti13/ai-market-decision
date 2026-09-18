@@ -6,221 +6,408 @@ from datetime import timedelta
 import pandas as pd
 import streamlit as st
 
-from alerts import send_telegram
-from config import ALL_UNIVERSE, APP_NAME, APP_VERSION, DEFAULTS
-from db import log_signal, recent_events, recent_paper_trades, record_event_once
+from alerts import send_telegram, telegram_configured
+from config import ALL_UNIVERSE, APP_BUILD, APP_NAME, APP_VERSION, DEFAULTS
+from db import (
+    all_positions,
+    close_position,
+    open_position,
+    open_positions,
+    prediction_history,
+    prediction_metrics,
+    recent_events,
+    record_event_once,
+)
 from model_engine import walk_forward_backtest
+from portfolio import monitor_open_positions, position_pnl
 from scanner import scanner
 from signal_engine import analyze_asset
-
-@st.cache_data(ttl=240, show_spinner=False)
-def cached_analysis(ticker: str, capital: float, risk_pct: float, refresh_nonce: int = 0):
-    return analyze_asset(ticker, capital, risk_pct)
+from verification import store_analysis_predictions, verify_matured_predictions
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
-st.title("📈 AI Market Decision V6")
-st.caption("DAY + WEEK + MONTH · PRE-MARKET → CONFERMA 5m → ENTRY → RICALCOLO → EXIT")
+
+@st.cache_data(ttl=45, show_spinner=False)
+def cached_analysis(ticker: str, capital: float, risk_pct: float, nonce: int = 0):
+    return analyze_asset(ticker, capital, risk_pct)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_verification(nonce: int = 0):
+    return verify_matured_predictions()
+
+
+def pct(v) -> str:
+    try:
+        return f"{float(v) * 100:.2f}%"
+    except Exception:
+        return "—"
+
+
+def num(v, digits: int = 2) -> str:
+    try:
+        return f"{float(v):.{digits}f}"
+    except Exception:
+        return "—"
+
+
+def render_model_box(title: str, dat: dict):
+    st.markdown(f"#### {title}")
+    if dat.get("signal") == "N/A":
+        st.error(dat.get("error", "Modello non disponibile"))
+        return
+    a, b, c, d = st.columns(4)
+    a.metric("Segnale", dat.get("signal", "HOLD"))
+    b.metric("P(up)", pct(dat.get("p_up", 0.5)))
+    c.metric("Rendimento atteso", pct(dat.get("expected_return", 0.0)))
+    d.metric("Qualità modello", pct(dat.get("quality_score", 0.0)))
+    st.caption(
+        f"Accuracy {pct(dat.get('accuracy', 0.0))} · AUC {num(dat.get('auc', 0.5), 3)} · "
+        f"Brier {num(dat.get('brier', 0.25), 3)} · MAE {pct(dat.get('mae', 0.0))} · dati fino a {dat.get('data_asof', '—')}"
+    )
+
+
+def render_analysis(r: dict):
+    ticker = r["ticker"]
+    pre, confirm, plan, clock = r["pre"], r["confirm"], r["plan"], r["clock"]
+    st.subheader(f"{ticker} — {clock['status']}")
+    st.caption(
+        f"As of {clock['now'].strftime('%Y-%m-%d %H:%M:%S %Z')} · sessione {clock['open'].strftime('%H:%M')}–{clock['close'].strftime('%H:%M')} · "
+        f"gap source: {pre.get('gap_source', '—')}"
+    )
+
+    c = st.columns(7)
+    c[0].metric("DAY", pre.get("signal", "WAIT"), f"Score {num(pre.get('score', 50), 1)}/100")
+    c[1].metric("P(up)", pct(pre.get("p_up", 0.5)))
+    c[2].metric("Rend. atteso", pct(pre.get("expected_return", 0.0)))
+    c[3].metric("Confidence", pct(pre.get("confidence", 0.0)))
+    c[4].metric("Gap", pct(pre.get("gap", 0.0)))
+    c[5].metric("Event risk", pre.get("event_risk", "NORMAL"))
+    c[6].metric("Regime", r.get("regime", {}).get("regime", "UNKNOWN"))
+
+    st.markdown("### 🎯 DAY — ingresso operativo")
+    if clock["is_pre"]:
+        st.info(f"**{pre['signal']}** · {plan['trigger']} · apertura alle {clock['open'].strftime('%H:%M')}.")
+    elif clock["is_open"]:
+        status = confirm.get("status", "WAIT")
+        if status == "CONFIRMED":
+            st.success(f"✅ **{confirm.get('signal')}** — {confirm.get('message')}")
+        elif status == "WATCH":
+            st.info(f"👀 **{confirm.get('signal')}** — {confirm.get('message')}")
+        elif status == "CONFIRMING":
+            st.info(f"⏳ **CONFIRMING** — {confirm.get('message')}")
+        elif status == "INVALIDATED":
+            st.warning(f"⚠️ **INVALIDATED** — {confirm.get('message')}")
+        else:
+            st.info(f"**{status}** — {confirm.get('message', 'Nessun ingresso.')}")
+    else:
+        st.warning("Mercato chiuso: il DAY prepara la prossima sessione; nessun nuovo ingresso intraday adesso.")
+
+    p = st.columns(6)
+    p[0].metric("Azione", plan.get("action", "NON ENTRARE"))
+    p[1].metric("Entry", num(plan.get("entry")))
+    p[2].metric("Stop", num(plan.get("stop")))
+    p[3].metric("Target", num(plan.get("target")))
+    p[4].metric("R/R", num(plan.get("rr")))
+    p[5].metric("Size", str(plan.get("shares", 0)))
+    st.write(
+        f"**Rischio teorico:** {num(plan.get('risk_amount'))} · **Finestra ingresso:** {plan.get('entry_window')} · "
+        f"**Validità:** {plan.get('validity')}"
+    )
+    st.caption(f"Driver: {' · '.join(pre.get('drivers') or ['nessun driver forte'])}")
+
+    st.markdown("### 🕐 Conferma 5 minuti")
+    q = st.columns(7)
+    q[0].metric("Stato", confirm.get("status", "WAIT"))
+    q[1].metric("Segnale", confirm.get("signal", "WAIT"))
+    q[2].metric("Prezzo", num(confirm.get("current", pre.get("indicative"))))
+    q[3].metric("VWAP", num(confirm.get("vwap", pre.get("indicative"))))
+    q[4].metric("15m", pct(confirm.get("ret15m", 0.0)))
+    q[5].metric("Vol ratio", num(confirm.get("volume_ratio", 1.0)))
+    q[6].metric("Barre 5m", str(confirm.get("bars", 0)))
+
+    st.markdown("### 📆 WEEK / MONTH")
+    w, m = st.columns(2)
+    with w:
+        render_model_box("WEEK", r["week"])
+    with m:
+        render_model_box("MONTH", r["month"])
+
+    st.markdown("### 🌍 Regime + macro")
+    regime, macro = r.get("regime", {}), r.get("macro", {})
+    a, b, c, d, e = st.columns(5)
+    a.metric("Regime", regime.get("regime", "UNKNOWN"))
+    b.metric("Regime score", num(regime.get("score", 0), 0))
+    c.metric("VIX", num(regime.get("vix", macro.get("vix", 0))))
+    d.metric("10Y", num(macro.get("tnx", 0)))
+    e.metric("Macro risk", macro.get("risk_label", "NEUTRAL"))
+    st.caption(
+        f"SPY 20d {pct(regime.get('spy20', 0))} · QQQ 20d {pct(regime.get('qqq20', 0))} · "
+        f"IWM 20d {pct(regime.get('iwm20', 0))} · DXY 5d {pct(macro.get('dxy_change_5d', 0))} · Oil 5d {pct(macro.get('oil_change_5d', 0))}"
+    )
+
+    st.markdown("### ⚡ Eventi / news intelligence")
+    events = r.get("events", {})
+    earnings = events.get("earnings", {})
+    a, b, c, d = st.columns(4)
+    a.metric("Event risk", events.get("event_risk", "NORMAL"))
+    b.metric("Catalyst", events.get("catalyst", "NONE"))
+    c.metric("News sentiment", num(events.get("news", {}).get("sentiment", 0), 3))
+    d.metric("Prossimi earnings", earnings.get("next_earnings") or "N/D")
+    news = r.get("news", [])
+    if news:
+        for item in news[:8]:
+            title = item.get("title", "News")
+            publisher = item.get("publisher", "Source")
+            cats = ", ".join(item.get("categories", []))
+            score = item.get("sentiment", 0.0)
+            url = item.get("url")
+            line = f"**{title}** — {publisher} · {cats} · sentiment {score:+.2f}"
+            st.markdown(line + (f" · [Apri]({url})" if url else ""))
+    else:
+        st.caption("Nessuna news disponibile in questo aggiornamento.")
+
+    with st.expander("🧾 Fondamentali correnti"):
+        f = r.get("fundamentals", {})
+        if f and "error" not in f:
+            cols = [
+                "shortName", "sector", "industry", "marketCap", "trailingPE", "forwardPE",
+                "profitMargins", "returnOnEquity", "revenueGrowth", "earningsGrowth",
+                "debtToEquity", "freeCashflow", "averageVolume", "beta",
+            ]
+            st.dataframe(pd.DataFrame([{k: f[k] for k in cols if k in f}]), use_container_width=True, hide_index=True)
+        else:
+            st.caption(f.get("error", "Fondamentali non disponibili."))
+
+    with st.expander("🩺 Data health / modello"):
+        h = r.get("health", {})
+        st.write({
+            "status": h.get("status"), "daily_bars": h.get("daily_bars"), "intraday_bars": h.get("intraday_bars"),
+            "premarket_bars": h.get("premarket_bars"), "daily_last": h.get("daily_last"),
+            "intraday_last": h.get("intraday_last"), "warnings": h.get("warnings"),
+        })
+        st.write({
+            "DAY accuracy": pre.get("model_accuracy"), "DAY AUC": pre.get("model_auc"),
+            "DAY Brier": pre.get("model_brier"), "DAY quality": pre.get("quality_score"),
+            "DAY data_asof": pre.get("model_data_asof"),
+        })
+        st.caption("Fonte attuale: Yahoo Finance/yfinance, adatta al test del prototipo ma non equivalente a un feed professionale con SLA.")
+
+    if plan.get("status") == "READY" and confirm.get("status") == "CONFIRMED":
+        event_key = f"V7|{ticker}|DAY|{clock['now'].date()}|{confirm.get('signal')}"
+        if record_event_once(
+            event_key, ticker, "DAY", confirm.get("signal", ""),
+            plan.get("entry", 0.0), plan.get("stop", 0.0), plan.get("target", 0.0),
+            notes="V7 confirmed DAY signal",
+        ):
+            send_telegram(
+                f"AI Market Decision V7\n{ticker} DAY\n{confirm.get('signal')}\n"
+                f"Entry {plan.get('entry', 0):.2f}\nStop {plan.get('stop', 0):.2f}\nTarget {plan.get('target', 0):.2f}\n"
+                f"P(up) {pre.get('p_up', .5)*100:.1f}%\nEvent risk {pre.get('event_risk')}"
+            )
+
+
+st.title("📈 AI Market Decision V7")
+st.caption("DAY + WEEK + MONTH · ensemble ML · news/eventi · macro/regime · scanner · walk-forward · verifica automatica · paper positions")
 
 with st.sidebar:
     st.header("Impostazioni")
     ticker = st.text_input("Asset / ticker", "NVDA", help="Esempi: NVDA, AAPL, SPY, ASML.AS, ENEL.MI").strip().upper()
     capital = st.number_input("Capitale di riferimento", min_value=100.0, value=float(DEFAULTS["capital"]), step=500.0)
-    risk_pct = st.number_input("Rischio massimo per operazione (%)", min_value=0.1, max_value=5.0, value=DEFAULTS["risk_pct"] * 100, step=0.1) / 100
+    risk_pct = st.number_input(
+        "Rischio massimo per operazione (%)", min_value=0.1, max_value=5.0,
+        value=float(DEFAULTS["risk_pct"] * 100), step=0.1,
+    ) / 100
     auto = st.toggle("Ricalcolo automatico", value=True)
     refresh_minutes = st.selectbox("Intervallo", [1, 5, 10], index=1, disabled=not auto)
-    force_refresh = st.button("🔄 Ricalcola ora", type="primary")
-    if force_refresh:
-        st.session_state["manual_refresh_nonce"] = int(st.session_state.get("manual_refresh_nonce", 0)) + 1
+    if st.button("🔄 Ricalcola ora", type="primary"):
+        st.session_state["refresh_nonce"] = int(st.session_state.get("refresh_nonce", 0)) + 1
+        st.session_state.pop("analysis_key", None)
     st.divider()
-    st.caption("Uso previsto: supporto decisionale quantitativo e paper trading. Nessun ordine viene inviato al broker.")
+    st.caption(f"{APP_BUILD} · supporto decisionale/paper trading; nessun ordine viene inviato al broker.")
 
-cache_key = f"analysis::{ticker}::{capital:.2f}::{risk_pct:.5f}"
-if force_refresh or st.session_state.get("analysis_key") != cache_key:
+nonce = int(st.session_state.get("refresh_nonce", 0))
+cache_key = f"{ticker}|{capital:.2f}|{risk_pct:.5f}|{nonce}"
+if st.session_state.get("analysis_key") != cache_key:
     try:
-        with st.spinner(f"Calcolo di {ticker}: DAY / WEEK / MONTH..."):
-            result = cached_analysis(ticker, capital, risk_pct, int(st.session_state.get("manual_refresh_nonce", 0)))
+        with st.spinner(f"Analisi {ticker}: DAY / WEEK / MONTH + eventi + macro..."):
+            result = cached_analysis(ticker, capital, risk_pct, nonce)
         st.session_state["analysis"] = result
         st.session_state["analysis_key"] = cache_key
+        store_analysis_predictions(result)
     except Exception as exc:
-        st.error(f"Errore di analisi: {exc}")
+        st.error(f"Analisi non disponibile: {exc}")
         st.stop()
 else:
     result = st.session_state["analysis"]
 
-# Auto-refresh only the main live panel; Streamlit 1.63+ supports independent fragments.
+# Automatic outcome verification runs at most once per hour because the function is cached.
+try:
+    st.session_state["auto_verify_result"] = cached_verification(0)
+except Exception as exc:
+    st.session_state["auto_verify_result"] = {"checked": 0, "evaluated": 0, "errors": [str(exc)]}
+
+
 @st.fragment(run_every=timedelta(minutes=refresh_minutes) if auto else None)
 def live_panel():
-    current = cached_analysis(ticker, capital, risk_pct, int(st.session_state.get("manual_refresh_nonce", 0))) if auto else result
+    current = cached_analysis(ticker, capital, risk_pct, nonce) if auto else result
     st.session_state["analysis"] = current
+    try:
+        store_analysis_predictions(current)
+    except Exception:
+        pass
     render_analysis(current)
 
 
-def render_analysis(r: dict):
-    pre, confirm, plan, clock = r["pre"], r["confirm"], r["plan"], r["clock"]
-    st.subheader(f"{ticker} — {clock['status']}")
-    st.write(f"As of **{clock['now'].strftime('%Y-%m-%d %H:%M:%S %Z')}** · sessione {clock['open'].strftime('%H:%M')}–{clock['close'].strftime('%H:%M')}")
-
-    c = st.columns(6)
-    c[0].metric("DAY", pre["signal"], f"Score {pre['score']:.1f}/100")
-    c[1].metric("P(up)", f"{pre['p_up']*100:.1f}%")
-    c[2].metric("Rend. atteso", f"{pre['expected_return']*100:.2f}%")
-    c[3].metric("Confidence", f"{pre['confidence']*100:.1f}%")
-    c[4].metric("Gap", f"{pre['gap']*100:.2f}%")
-    c[5].metric("Regime", pre["regime"]["regime"])
-
-    st.markdown("### 🎯 DAY — ingresso operativo")
-    if clock["status"] == "PRE-MARKET":
-        st.info(f"**{pre['signal']}** — non entrare alla cieca all'apertura. Trigger: **{plan['trigger']}**. Apertura alle **{clock['open'].strftime('%H:%M')}**.")
-    elif clock["is_open"]:
-        if confirm["status"] == "CONFIRMED":
-            st.success(f"✅ **{confirm['signal']}** — {confirm['message']}")
-        elif confirm["status"] == "CONFIRMING":
-            st.info(f"⏳ **CONFIRMING** — {confirm['message']}")
-        elif confirm["status"] == "INVALIDATED":
-            st.warning("⚠️ **SEGNALE INVALIDATO** — non entrare sulla previsione pre-market.")
-        else:
-            st.info(f"⏳ **{confirm['status']}** — {confirm['message']}")
-    else:
-        st.warning("Mercato chiuso: nessun nuovo ingresso DAY fino alla prossima sessione.")
-
-    p = st.columns(5)
-    p[0].metric("Azione", plan["action"])
-    p[1].metric("Entry", f"{plan['entry']:.2f}")
-    p[2].metric("Stop", f"{plan['stop']:.2f}")
-    p[3].metric("Target", f"{plan['target']:.2f}")
-    p[4].metric("R/R", f"{plan['rr']:.2f}")
-    st.write(f"**Size indicativa:** {plan['shares']} quote · **Rischio teorico:** {plan['risk_amount']:.2f} · {plan['validity']}")
-    st.caption(f"Driver: {' · '.join(pre['drivers']) if pre['drivers'] else 'nessun driver forte'}")
-
-    st.markdown("### 🕐 Conferma apertura 5m")
-    q = st.columns(6)
-    q[0].metric("Stato", confirm.get("status", "WAIT"))
-    q[1].metric("Segnale", confirm.get("signal", "WAIT"))
-    q[2].metric("Prezzo", f"{confirm.get('current', pre['indicative']):.2f}")
-    q[3].metric("Da open", f"{(confirm.get('current', pre['indicative']) / max(confirm.get('open', pre['indicative']), 1e-9) - 1)*100:.2f}%")
-    q[4].metric("VWAP", f"{confirm.get('vwap', pre['indicative']):.2f}")
-    q[5].metric("Barre 5m", str(confirm.get("bars", 0)))
-
-    st.markdown("### 📆 WEEK / MONTH")
-    w, m = st.columns(2)
-    for box, title, dat in [(w, "WEEK", r["week"]), (m, "MONTH", r["month"])]:
-        with box:
-            st.markdown(f"#### {title}")
-            if dat.get("signal") == "N/A":
-                st.error(dat.get("error", "Modello non disponibile"))
-            else:
-                a, b, c = st.columns(3)
-                a.metric("Segnale", dat["signal"])
-                b.metric("P(up)", f"{dat['p_up']*100:.1f}%")
-                c.metric("Rendimento atteso", f"{dat['expected_return']*100:.2f}%")
-                st.caption(f"Accuracy holdout {dat['accuracy']*100:.1f}% · Brier {dat['brier']:.3f} · MAE {dat['mae']*100:.2f}% · dati fino a {dat['data_asof']}")
-
-    st.markdown("### 🌍 Contesto mercato")
-    mc = r["regime"]
-    a, b, c, d = st.columns(4)
-    a.metric("Regime", mc["regime"])
-    b.metric("SPY 5d", f"{mc['spy5']*100:.2f}%")
-    c.metric("QQQ 5d", f"{mc['qqq5']*100:.2f}%")
-    d.metric("VIX", f"{mc['vix']:.2f}")
-
-    st.markdown("### 🧾 Fondamentali correnti")
-    f = r.get("fundamentals", {})
-    if f and "error" not in f:
-        cols = ["shortName", "sector", "industry", "marketCap", "trailingPE", "forwardPE", "profitMargins", "returnOnEquity", "revenueGrowth", "earningsGrowth", "debtToEquity", "freeCashflow"]
-        table = {k: f[k] for k in cols if k in f}
-        st.dataframe(pd.DataFrame([table]), use_container_width=True, hide_index=True)
-    else:
-        st.caption("Dati fondamentali correnti non disponibili in questo aggiornamento.")
-
-    st.markdown("### 📰 News recenti")
-    if r["news"]:
-        for item in r["news"][:8]:
-            title, publisher, url = item.get("title", "News"), item.get("publisher", "Source"), item.get("url")
-            if url:
-                st.markdown(f"**{title}** — {publisher} · [Apri]({url})")
-            else:
-                st.write(f"**{title}** — {publisher}")
-    else:
-        st.caption("Nessuna news disponibile.")
-
-    health = r["health"]
-    with st.expander("🩺 Data health"):
-        st.write({"status": health["status"], "daily_bars": health["daily_bars"], "intraday_bars": health["intraday_bars"], "premarket_bars": health["premarket_bars"], "warnings": health["warnings"]})
-        st.caption("Fonte di mercato nel prototipo: Yahoo Finance tramite yfinance. Per uso professionale/live serve una fonte market-data con SLA e feed adeguati.")
-
-    if plan["status"] == "READY" and confirm.get("status") == "CONFIRMED":
-        event_key = f"{ticker}|DAY|{clock['now'].date()}|{confirm.get('signal')}"
-        if record_event_once(event_key, ticker, "DAY", confirm.get("signal", ""), plan["entry"], plan["stop"], plan["target"], notes="V6 confirmed signal"):
-            send_telegram(f"AI Market Decision\n{ticker} DAY\n{confirm.get('signal')}\nEntry {plan['entry']:.2f}\nStop {plan['stop']:.2f}\nTarget {plan['target']:.2f}\nP(up) {pre['p_up']*100:.1f}%")
-
 live_panel()
-
 st.divider()
-tabs = st.tabs(["🔎 Scanner", "📊 Backtest", "📒 Journal", "ℹ️ Info"])
+
+tabs = st.tabs(["🔎 Scanner", "📊 Backtest", "✅ Verifica previsioni", "💼 Posizioni", "🛠️ Sistema"])
 
 with tabs[0]:
-    st.subheader("AI Market Scanner")
-    scan_n = st.slider("Numero di asset", 5, min(20, len(ALL_UNIVERSE)), DEFAULTS["scanner_assets"])
+    st.subheader("Market Scanner V7")
+    c1, c2, c3 = st.columns(3)
+    scan_n = c1.slider("Numero asset", 5, min(25, len(ALL_UNIVERSE)), int(DEFAULTS["scanner_assets"]))
+    horizon_view = c2.selectbox("Vista", ["DAY", "WEEK", "MONTH"])
+    side_view = c3.selectbox("Segnali", ["TUTTI", "BUY", "SELL"])
     if st.button("🚀 Scansiona mercato", type="primary"):
-        with st.spinner("Scansione parallela DAY / WEEK / MONTH..."):
-            st.session_state["scan_df"] = scanner(ALL_UNIVERSE, scan_n)
-    df = st.session_state.get("scan_df")
+        with st.spinner("Scansione parallela... può richiedere alcuni minuti con Yahoo Finance."):
+            st.session_state["scan_df_v7"] = scanner(ALL_UNIVERSE, scan_n)
+    df = st.session_state.get("scan_df_v7")
     if isinstance(df, pd.DataFrame) and not df.empty:
-        for title, signal_col, prob_col, exp_col in [
-            ("DAY", "DAY", "DAY_prob", "DAY_exp"),
-            ("WEEK", "WEEK", "WEEK_prob", "WEEK_exp"),
-            ("MONTH", "MONTH", "MONTH_prob", "MONTH_exp"),
-        ]:
-            st.markdown(f"#### {title}")
-            view = df[["ticker", signal_col, prob_col, exp_col, "regime", "news"]].sort_values([prob_col, exp_col], ascending=[False, False])
-            st.dataframe(view, use_container_width=True, hide_index=True)
-            st.caption("Ordinamento per probabilità del modello e rendimento atteso; non rappresenta una garanzia di performance futura.")
+        sig, prob, exp, score = horizon_view, f"{horizon_view}_prob", f"{horizon_view}_exp", f"{horizon_view}_score"
+        view = df.copy()
+        if side_view == "BUY":
+            view = view[view[sig].astype(str).str.contains("BUY")]
+        elif side_view == "SELL":
+            view = view[view[sig].astype(str).str.contains("SELL")]
+        cols = ["ticker", sig, prob, exp, score, "event_risk", "catalyst", "regime", "news"]
+        st.dataframe(view[cols].sort_values(score, ascending=False), use_container_width=True, hide_index=True)
+        st.caption("Score = priorità del modello in base a probabilità, edge atteso e qualità. Non è una classifica di rendimento garantito.")
     else:
         st.info("Premi 'Scansiona mercato'.")
 
 with tabs[1]:
     st.subheader("Walk-forward Backtest")
-    horizon = st.selectbox("Orizzonte", ["WEEK", "MONTH"])
+    c1, c2 = st.columns(2)
+    horizon_bt = c1.selectbox("Orizzonte backtest", ["DAY", "WEEK", "MONTH"])
+    folds = c2.slider("Numero massimo finestre", 20, 100, 60, 10)
     if st.button("▶️ Esegui backtest"):
         try:
             with st.spinner("Walk-forward in corso..."):
-                bt = walk_forward_backtest(ticker, horizon, max_folds=60)
-            st.session_state["backtest"] = bt
+                st.session_state["backtest_v7"] = walk_forward_backtest(ticker, horizon_bt, max_folds=folds)
         except Exception as exc:
             st.error(f"Backtest non disponibile: {exc}")
-    bt = st.session_state.get("backtest")
+    bt = st.session_state.get("backtest_v7")
     if bt:
-        a, b, c, d = st.columns(4)
-        a.metric("Ritorno cumulato", f"{bt['cumulative_return']*100:.2f}%")
-        b.metric("Max drawdown", f"{bt['max_drawdown']*100:.2f}%")
-        c.metric("Win rate", f"{bt['win_rate']*100:.1f}%")
-        d.metric("Profit factor", f"{bt['profit_factor']:.2f}" if bt['profit_factor'] != float('inf') else "∞")
+        a, b, c, d, e = st.columns(5)
+        a.metric("Ritorno cumulato", pct(bt.get("cumulative_return", 0)))
+        b.metric("Max drawdown", pct(bt.get("max_drawdown", 0)))
+        c.metric("Win rate", pct(bt.get("win_rate", 0)))
+        pf = bt.get("profit_factor", 0)
+        d.metric("Profit factor", "∞" if pf == float("inf") else num(pf))
+        e.metric("Trade", str(bt.get("trades", 0)))
         st.write(bt)
 
 with tabs[2]:
-    st.subheader("Paper Trading Journal")
-    if st.button("📝 Registra il piano corrente come PAPER TRADE"):
-        p = st.session_state["analysis"]["plan"]
-        if p["status"] == "READY":
-            log_signal(ticker, "DAY", p["side"], st.session_state["analysis"]["confirm"].get("signal", ""), p["entry"], p["stop"], p["target"], p["shares"], notes="V6 manual paper trade")
-            st.success("Paper trade registrato.")
-        else:
-            st.warning("Nessun piano pronto da registrare.")
-    trades = recent_paper_trades(50)
-    st.dataframe(trades, use_container_width=True, hide_index=True)
-    st.markdown("#### Eventi segnale")
-    st.dataframe(recent_events(50), use_container_width=True, hide_index=True)
+    st.subheader("Storico + verifica automatica")
+    if st.button("🔍 Verifica ora le previsioni maturate"):
+        st.session_state["verify_nonce"] = int(st.session_state.get("verify_nonce", 0)) + 1
+        st.session_state["verify_result"] = cached_verification(int(st.session_state["verify_nonce"]))
+    vr = st.session_state.get("verify_result") or st.session_state.get("auto_verify_result")
+    if vr:
+        st.info(f"Ultima verifica: controllate {vr.get('checked', 0)} · valutate {vr.get('evaluated', 0)}")
+        if vr.get("errors"):
+            st.warning(vr["errors"])
+    metrics = prediction_metrics()
+    a, b, c = st.columns(3)
+    a.metric("Previsioni valutate", metrics.get("evaluated", 0))
+    b.metric("Accuracy segnali valutati", pct(metrics.get("accuracy", 0)))
+    c.metric("Rendimento reale medio target", pct(metrics.get("avg_actual_return", 0)))
+    hist = prediction_history(200)
+    st.dataframe(hist, use_container_width=True, hide_index=True)
+    st.caption("La verifica confronta il segnale salvato con il rendimento realizzato al target temporale. WAIT/HOLD è considerato corretto solo se il movimento resta sotto la soglia dell'orizzonte.")
 
 with tabs[3]:
-    st.subheader("Come leggere il sistema")
+    st.subheader("Paper Position Tracker")
+    monitor = monitor_open_positions(auto_close_levels=True)
+    for ev in monitor.get("events", []):
+        key = f"V7|POSITION|{ev['id']}|{ev['reason']}"
+        if record_event_once(key, ev["ticker"], "POSITION", ev["reason"], ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}"):
+            send_telegram(f"AI Market Decision V7\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
+    if monitor.get("errors"):
+        st.warning(monitor["errors"])
+
+    st.markdown("#### Apri dal piano DAY corrente")
+    plan = st.session_state["analysis"].get("plan", {})
+    if plan.get("status") == "READY":
+        st.write({k: plan.get(k) for k in ["side", "entry", "stop", "target", "shares", "risk_amount"]})
+        if st.button("➕ Registra piano come PAPER POSITION"):
+            pid = open_position(
+                ticker, "DAY", plan["side"], int(plan["shares"]), float(plan["entry"]),
+                float(plan["stop"]), float(plan["target"]), notes="V7 current DAY plan",
+            )
+            st.success(f"Paper position registrata (ID {pid}).")
+    else:
+        st.info("Il piano corrente non è READY: nessuna posizione suggerita da registrare.")
+
+    with st.expander("Aggiungi posizione manuale"):
+        mticker = st.text_input("Ticker posizione", ticker, key="mticker").strip().upper()
+        mside = st.selectbox("Lato", ["LONG", "SHORT"], key="mside")
+        mhorizon = st.selectbox("Orizzonte", ["DAY", "WEEK", "MONTH"], key="mhorizon")
+        mq = st.number_input("Quantità", 1, 1_000_000, 1, key="mq")
+        me = st.number_input("Entry", min_value=0.0001, value=max(0.0001, float(plan.get("entry", 100.0) or 100.0)), key="me")
+        ms = st.number_input("Stop", min_value=0.0, value=max(0.0, float(plan.get("stop", 0.0) or 0.0)), key="ms")
+        mt = st.number_input("Target", min_value=0.0, value=max(0.0, float(plan.get("target", 0.0) or 0.0)), key="mt")
+        if st.button("Salva posizione manuale"):
+            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7 manual paper position")
+            st.success(f"Posizione {pid} salvata.")
+
+    open_df = open_positions()
+    st.markdown("#### Aperte")
+    st.dataframe(open_df, use_container_width=True, hide_index=True)
+    if not open_df.empty:
+        ids = [int(x) for x in open_df["id"].tolist()]
+        selected = st.selectbox("ID da chiudere manualmente", ids)
+        row = open_df.loc[open_df["id"] == selected].iloc[0]
+        exit_price = st.number_input("Prezzo uscita", min_value=0.0001, value=max(0.0001, float(row.get("last_price") or row["entry"])), key="exit_price")
+        if st.button("Chiudi posizione selezionata"):
+            pnl = position_pnl(row["side"], int(row["quantity"]), float(row["entry"]), float(exit_price))
+            close_position(selected, float(exit_price), pnl, "MANUAL")
+            st.success(f"Posizione {selected} chiusa. PnL paper: {pnl:.2f}")
+    st.markdown("#### Storico")
+    st.dataframe(all_positions(200), use_container_width=True, hide_index=True)
+
+with tabs[4]:
+    st.subheader("Sistema / deploy / alert")
+    st.write({
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "build": APP_BUILD,
+        "telegram_configured": telegram_configured(),
+        "data_source": "Yahoo Finance via yfinance",
+        "database": "PostgreSQL se DATABASE_URL è configurato, altrimenti SQLite locale",
+    })
+    if st.button("📨 Test Telegram"):
+        if send_telegram("AI Market Decision V7 — test alert OK"):
+            st.success("Messaggio Telegram inviato.")
+        else:
+            st.warning("Telegram non configurato o invio fallito. Controlla TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nei Secrets.")
     st.markdown(
         """
-        **DAY** usa un modello open→close sulle giornate storiche, il gap/overnight, il contesto di mercato, le news e, quando il mercato è aperto, una conferma intraday su barre 5m e VWAP.\n\n        **WEEK** e **MONTH** sono modelli separati: non vengono sostituiti dal segnale DAY.\n\n        La probabilità è una stima del modello, non una probabilità matematica certa dell'esito. Il backtest è walk-forward e va trattato come diagnostica, non come promessa di rendimento.\n\n        Per gli short il conto/broker deve consentire la vendita allo scoperto; in caso contrario usa i segnali SELL come uscita/avoid, non come apertura short.
+        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7 non invia ordini e non garantisce profitti.\n\n
+        **Short:** ENTER SELL/SHORT richiede un conto che consenta la vendita allo scoperto; altrimenti interpreta SELL come uscita/avoid.\n\n
+        **Persistenza:** su Streamlit Cloud usa PostgreSQL/Supabase tramite `DATABASE_URL`; il filesystem locale può essere ricreato nei redeploy.
         """
     )
-    st.info("Il prototipo non manda ordini al broker. Gli alert Telegram sono opzionali e vengono inviati solo per un evento DAY confermato, una volta per sessione/segnale.")
+    st.markdown("#### Eventi registrati")
+    st.dataframe(recent_events(100), use_container_width=True, hide_index=True)
 
 payload = json.dumps(st.session_state["analysis"], default=str, ensure_ascii=False, indent=2)
-st.download_button("⬇️ Esporta analisi JSON", data=payload.encode("utf-8"), file_name=f"{ticker}_analysis_v6.json", mime="application/json")
-st.caption(f"AI Market Decision V{APP_VERSION} · aggiornamento automatico {refresh_minutes} min quando attivo")
+st.download_button(
+    "⬇️ Esporta analisi JSON",
+    data=payload.encode("utf-8"),
+    file_name=f"{ticker}_analysis_v7.json",
+    mime="application/json",
+)
+st.caption(f"AI Market Decision V{APP_VERSION} · {APP_BUILD} · refresh {refresh_minutes if auto else 'manuale'} min")
