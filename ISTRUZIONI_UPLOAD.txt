@@ -1,0 +1,9 @@
+V7 - FILE MANCANTI
+
+Carica il CONTENUTO di questa cartella nella root del repository GitHub ai-market-decision.
+Non caricare la cartella V7_file_mancanti come sottocartella.
+
+Per .streamlit/config.toml, la destinazione deve rimanere:
+.streamlit/config.toml
+
+Dopo il caricamento fai Commit changes.

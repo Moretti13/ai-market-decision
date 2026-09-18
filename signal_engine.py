@@ -1,131 +1,174 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
 from config import DEFAULTS
 from data_layer import (
+    current_fundamentals,
     daily_features,
+    data_health,
     fetch,
     intraday_features,
     latest_regular,
-    news_context,
     premarket_df,
     safe_float,
-    current_fundamentals,
-    data_health,
 )
+from events_engine import event_context
 from market_clock import market_status
 from model_engine import train_day_model, train_medium_model
+from regime_engine import market_regime
 
 
-def _regime() -> Dict:
-    try:
-        spy = daily_features(fetch("SPY", "6mo", "1d"))
-        qqq = daily_features(fetch("QQQ", "6mo", "1d"))
-        vix = daily_features(fetch("^VIX", "6mo", "1d"))
-        spy5 = safe_float(spy["ret5"].iloc[-1])
-        qqq5 = safe_float(qqq["ret5"].iloc[-1])
-        vix_last = safe_float(vix["Close"].iloc[-1], 20.0)
-        vix20 = safe_float(vix["Close"].rolling(20, min_periods=5).mean().iloc[-1], vix_last)
-        risk_off = (spy5 < -0.02 and qqq5 < -0.02) or vix_last > max(25.0, vix20 * 1.15)
-        risk_on = spy5 > 0.02 and qqq5 > 0.02 and vix_last < vix20 * 1.10
-        regime = "RISK-OFF / HIGH VOL" if risk_off else "RISK-ON" if risk_on else "NEUTRAL"
-        return {"regime": regime, "spy5": spy5, "qqq5": qqq5, "vix": vix_last, "vix20": vix20}
-    except Exception:
-        return {"regime": "UNKNOWN", "spy5": 0.0, "qqq5": 0.0, "vix": 20.0, "vix20": 20.0}
+def _completed_daily(ticker: str) -> pd.DataFrame:
+    d = daily_features(fetch(ticker, "7y", "1d"))
+    if d.empty:
+        return d
+    status = market_status(ticker)
+    if status["is_pre"] or status["is_open"]:
+        d = d.loc[np.array(d.index.date) < status["now"].date()]
+    return d
 
 
-def _overlay_day(day: Dict, gap: float, news_sentiment: float, regime: Dict, intraday: Dict | None = None) -> Dict:
-    p = safe_float(day.get("p_up"), 0.5)
-    expected = safe_float(day.get("expected_return"))
+def _decision_overlay(day_model: Dict, gap: float, events: Dict, regime: Dict, intraday: Dict | None = None) -> Dict:
+    base_p = safe_float(day_model.get("p_up"), 0.5)
+    p = base_p
+    expected = safe_float(day_model.get("expected_return"), 0.0)
     drivers: List[tuple[float, str]] = []
 
-    gap_adj = float(np.clip(gap * 1.5, -0.10, 0.10))
-    p = float(np.clip(p + gap_adj, 0.01, 0.99))
-    drivers.append((abs(gap_adj), "gap/overnight"))
+    gap_adj = float(np.clip(gap * 1.25, -0.05, 0.05))
+    p += gap_adj
+    if abs(gap_adj) >= 0.005:
+        drivers.append((abs(gap_adj), "gap/overnight"))
 
-    news_adj = float(np.clip(news_sentiment * 0.05, -0.05, 0.05))
-    p = float(np.clip(p + news_adj, 0.01, 0.99))
-    if abs(news_adj) >= 0.01:
-        drivers.append((abs(news_adj), "news"))
+    news = events.get("news", {})
+    news_adj = float(np.clip(safe_float(news.get("sentiment")) * (0.3 + safe_float(news.get("importance"))) * 0.045, -0.05, 0.05))
+    p += news_adj
+    if abs(news_adj) >= 0.005:
+        drivers.append((abs(news_adj), f"news/{events.get('catalyst', 'GENERAL')}") )
 
-    regime_adj = 0.0
-    if regime["regime"] == "RISK-OFF / HIGH VOL":
-        regime_adj = -0.035
-    elif regime["regime"] == "RISK-ON":
-        regime_adj = 0.025
-    p = float(np.clip(p + regime_adj, 0.01, 0.99))
-    if regime_adj:
-        drivers.append((abs(regime_adj), "market regime"))
+    regime_adj = float(np.clip(safe_float(regime.get("score")) / 100 * 0.045, -0.045, 0.045))
+    p += regime_adj
+    if abs(regime_adj) >= 0.005:
+        drivers.append((abs(regime_adj), "regime mercato"))
 
-    if intraday and intraday.get("bars", 0) >= 2:
-        intraday_adj = 0.0
-        if safe_float(intraday.get("current")) >= safe_float(intraday.get("vwap")) and safe_float(intraday.get("ret15m")) > 0:
-            intraday_adj = 0.025
-        elif safe_float(intraday.get("current")) <= safe_float(intraday.get("vwap")) and safe_float(intraday.get("ret15m")) < 0:
-            intraday_adj = -0.025
-        p = float(np.clip(p + intraday_adj, 0.01, 0.99))
-        if intraday_adj:
+    intraday_adj = 0.0
+    if intraday and int(intraday.get("bars", 0)) >= 2:
+        current = safe_float(intraday.get("current"))
+        vwap = safe_float(intraday.get("vwap"), current)
+        ret15 = safe_float(intraday.get("ret15m"))
+        vol_ratio = safe_float(intraday.get("volume_ratio"), 1.0)
+        if current >= vwap and ret15 > 0:
+            intraday_adj += 0.02
+        elif current <= vwap and ret15 < 0:
+            intraday_adj -= 0.02
+        if vol_ratio >= 1.25:
+            intraday_adj *= 1.25
+        intraday_adj = float(np.clip(intraday_adj, -0.03, 0.03))
+        p += intraday_adj
+        if abs(intraday_adj) >= 0.005:
             drivers.append((abs(intraday_adj), "momentum intraday/VWAP"))
 
-    expected += (p - safe_float(day.get("p_up"), 0.5)) * 0.02
+    p = float(np.clip(p, 0.01, 0.99))
+    expected += (p - base_p) * 0.025
     expected = float(np.clip(expected, -0.15, 0.15))
-    conf = float(np.clip(0.50 + abs(p - 0.5) * 0.95, 0.50, 0.95))
-    signal = "PRE-BUY" if p >= DEFAULTS["buy_prob"] and expected >= DEFAULTS["day_min_edge"] else "PRE-SELL" if p <= DEFAULTS["sell_prob"] and expected <= -DEFAULTS["day_min_edge"] else "WAIT"
-    return {"p_up": p, "p_down": 1 - p, "expected_return": expected, "confidence": conf, "signal": signal, "drivers": [x[1] for x in sorted(drivers, reverse=True)[:6]]}
 
+    base_quality = safe_float(day_model.get("quality_score"), 0.4)
+    event_penalty = safe_float(events.get("risk_penalty"), 0.0)
+    confidence = float(np.clip((0.45 + abs(p - 0.5)) * (0.65 + 0.35 * base_quality) * (1 - event_penalty), 0.30, 0.95))
 
-def premarket_analysis(ticker: str) -> Dict:
-    t = ticker.strip().upper()
-    d = daily_features(fetch(t, "2y", "1d"))
-    if d.empty:
-        raise RuntimeError("Storico giornaliero non disponibile")
-    prev_close = safe_float(d["Close"].iloc[-1])
-    pre = premarket_df(t)
-    indicative = safe_float(pre["Close"].iloc[-1], prev_close) if not pre.empty else prev_close
-    gap = indicative / prev_close - 1 if prev_close else 0.0
-    nctx = news_context(t)
-    regime = _regime()
-
-    try:
-        day_model = train_day_model(t, live_gap=gap)
-    except Exception as exc:
-        day_model = {"signal": "WAIT", "p_up": 0.5, "p_down": 0.5, "expected_return": 0.0, "accuracy": 0.0, "brier": 0.0, "mae": 0.0, "error": str(exc), "model_note": "DAY fallback"}
-
-    over = _overlay_day(day_model, gap, nctx["sentiment"], regime)
-    pre_volume_ratio = 1.0
-    if not pre.empty:
-        v = pd.to_numeric(pre["Volume"], errors="coerce").fillna(0)
-        baseline = v.rolling(20, min_periods=5).mean().iloc[-1]
-        pre_volume_ratio = safe_float(v.iloc[-1] / baseline, 1.0) if baseline else 1.0
-    if abs(pre_volume_ratio - 1) > 0.5:
-        over["drivers"].insert(0, "volume pre-market")
+    if p >= DEFAULTS["buy_prob"] and expected >= DEFAULTS["day_min_edge"]:
+        signal = "PRE-BUY"
+    elif p <= DEFAULTS["sell_prob"] and expected <= -DEFAULTS["day_min_edge"]:
+        signal = "PRE-SELL"
+    else:
+        signal = "WAIT"
 
     return {
+        "p_up": p,
+        "p_down": 1 - p,
+        "expected_return": expected,
+        "confidence": confidence,
+        "signal": signal,
+        "decision_score": float(np.clip(50 + (p - 0.5) * 100, 0, 100)),
+        "drivers": [x[1] for x in sorted(drivers, reverse=True)[:6]],
+    }
+
+
+def _live_gap(ticker: str, prev_close: float) -> tuple[float, float, str, int]:
+    status = market_status(ticker)
+    if prev_close <= 0:
+        return 0.0, 0.0, "unavailable", 0
+    if status["is_open"]:
+        try:
+            raw = latest_regular(ticker)
+            if not raw.empty:
+                dates = raw.index.tz_convert(status["timezone"]).date
+                today = raw.loc[np.array(dates) == status["now"].date()]
+                if not today.empty:
+                    op = safe_float(today["Open"].iloc[0], prev_close)
+                    return op / prev_close - 1, safe_float(today["Close"].iloc[-1], op), "regular open", len(today)
+        except Exception:
+            pass
+    if status["is_pre"]:
+        try:
+            pre = premarket_df(ticker)
+            if not pre.empty:
+                dates = pre.index.tz_convert(status["timezone"]).date
+                today = pre.loc[np.array(dates) == status["now"].date()]
+                if not today.empty:
+                    indicative = safe_float(today["Close"].iloc[-1], prev_close)
+                    return indicative / prev_close - 1, indicative, "premarket 5m", len(today)
+        except Exception:
+            pass
+    return 0.0, prev_close, "gap non noto fino alla prossima sessione", 0
+
+
+def premarket_analysis(ticker: str, events: Dict | None = None, regime: Dict | None = None) -> Dict:
+    t = ticker.strip().upper()
+    d = _completed_daily(t)
+    if d.empty:
+        raise RuntimeError("Storico giornaliero completato non disponibile")
+    prev_close = safe_float(d["Close"].iloc[-1])
+    gap, indicative, gap_source, pre_bars = _live_gap(t, prev_close)
+    events = events or event_context(t)
+    regime = regime or market_regime()
+
+    try:
+        model = train_day_model(t, live_gap=gap)
+    except Exception as exc:
+        model = {
+            "signal": "WAIT", "p_up": 0.5, "p_down": 0.5, "expected_return": 0.0,
+            "accuracy": 0.0, "brier": 0.25, "mae": 0.0, "auc": 0.5,
+            "quality_score": 0.0, "error": str(exc), "model_note": "DAY fallback",
+            "data_asof": str(d.index[-1]),
+        }
+    over = _decision_overlay(model, gap, events, regime)
+    return {
         "ticker": t,
-        "signal": over["signal"],
-        "score": round(over["p_up"] * 100, 1),
-        "p_up": over["p_up"],
-        "p_down": over["p_down"],
-        "expected_return": over["expected_return"],
-        "confidence": over["confidence"],
+        **over,
+        "score": round(over["decision_score"], 1),
         "prev_close": prev_close,
         "indicative": indicative,
         "gap": gap,
-        "drivers": over["drivers"],
-        "model_accuracy": day_model.get("accuracy", 0.0),
-        "model_brier": day_model.get("brier", 0.0),
-        "model_mae": day_model.get("mae", 0.0),
-        "model_note": day_model.get("model_note", ""),
-        "model_error": day_model.get("error"),
-        "premarket_bars": len(pre),
-        "news_sentiment": nctx["sentiment"],
-        "news_count": nctx["count"],
+        "gap_source": gap_source,
+        "premarket_bars": pre_bars,
+        "model_accuracy": safe_float(model.get("accuracy")),
+        "model_brier": safe_float(model.get("brier"), 0.25),
+        "model_auc": safe_float(model.get("auc"), 0.5),
+        "model_mae": safe_float(model.get("mae")),
+        "quality_score": safe_float(model.get("quality_score")),
+        "model_note": model.get("model_note", ""),
+        "model_error": model.get("error"),
+        "model_data_asof": model.get("data_asof", str(d.index[-1])),
+        "event_risk": events.get("event_risk", "NORMAL"),
+        "catalyst": events.get("catalyst", "NONE"),
+        "news_sentiment": safe_float(events.get("news", {}).get("sentiment")),
+        "news_count": int(events.get("news", {}).get("count", 0)),
         "regime": regime,
     }
 
@@ -133,13 +176,11 @@ def premarket_analysis(ticker: str) -> Dict:
 def intraday_state(ticker: str) -> Dict:
     status = market_status(ticker)
     try:
-        raw = latest_regular(ticker)
-        x = intraday_features(raw, ticker)
+        x = intraday_features(latest_regular(ticker), ticker)
         if x.empty:
             return {"status": "WAIT_FOR_OPEN", "bars": 0, **status}
         dates = x.index.tz_convert(status["timezone"]).date
-        today_mask = dates == status["now"].date()
-        today = x.loc[today_mask]
+        today = x.loc[np.array(dates) == status["now"].date()]
         if today.empty:
             return {"status": "WAIT_FOR_OPEN", "bars": 0, **status}
         row = today.iloc[-1]
@@ -154,17 +195,59 @@ def intraday_state(ticker: str) -> Dict:
             "ret15m": safe_float(row["ret15m"]),
             "ret30m": safe_float(row["ret30m"]),
             "ret60m": safe_float(row["ret60m"]),
+            "session_ret": safe_float(row["session_ret"]),
             "vwap": safe_float(row["vwap"]),
             "vwap_dist": safe_float(row["vwap_dist"]),
             "volume_ratio": safe_float(row["volume_ratio"], 1.0),
             "or_high": safe_float(row["or_high"]),
             "or_low": safe_float(row["or_low"]),
             "or_pos": safe_float(row["or_pos"], 0.5),
-            "updated": str(x.index[-1]),
+            "updated": str(today.index[-1]),
             **status,
         }
     except Exception as exc:
         return {"status": "DATA_ERROR", "bars": 0, "error": str(exc), **status}
+
+
+def _confirmation_logic(pre_signal: str, state: Dict, min_bars: int | None = None) -> Dict:
+    min_bars = int(min_bars or DEFAULTS["day_confirm_bars"])
+    bars = int(state.get("bars", 0))
+    if bars < min_bars:
+        return {"status": "CONFIRMING", "signal": pre_signal, "message": f"Attendi almeno {min_bars} barre 5m complete.", "alignment_score": 0}
+    if pre_signal not in {"PRE-BUY", "PRE-SELL"}:
+        return {"status": "WAIT", "signal": "WAIT", "message": "Nessun vantaggio pre-sessione sufficiente.", "alignment_score": 0}
+
+    current = safe_float(state.get("current"))
+    opening = safe_float(state.get("open"), current)
+    vwap = safe_float(state.get("vwap"), current)
+    ret15 = safe_float(state.get("ret15m"))
+    session_ret = safe_float(state.get("session_ret"))
+    vol_ratio = safe_float(state.get("volume_ratio"), 1.0)
+    or_pos = safe_float(state.get("or_pos"), 0.5)
+
+    long_points = int(current > opening) + int(current >= vwap) + int(ret15 > 0) + int(session_ret > 0)
+    short_points = int(current < opening) + int(current <= vwap) + int(ret15 < 0) + int(session_ret < 0)
+    if bars >= DEFAULTS["day_opening_range_bars"]:
+        long_points += int(or_pos >= 0.60)
+        short_points += int(or_pos <= 0.40)
+    if vol_ratio >= 1.10:
+        if session_ret > 0:
+            long_points += 1
+        elif session_ret < 0:
+            short_points += 1
+
+    if pre_signal == "PRE-BUY":
+        if long_points >= 3 and long_points >= short_points + 2:
+            return {"status": "CONFIRMED", "signal": "ENTER BUY", "message": "Conferma rialzista su open, VWAP e momentum.", "alignment_score": long_points}
+        if short_points >= 4 and bars >= 3:
+            return {"status": "INVALIDATED", "signal": "WAIT", "message": "Il flusso intraday contraddice il PRE-BUY.", "alignment_score": -short_points}
+        return {"status": "WATCH", "signal": "BUY WATCH", "message": "Setup rialzista non ancora completo: attendi conferma.", "alignment_score": long_points - short_points}
+
+    if short_points >= 3 and short_points >= long_points + 2:
+        return {"status": "CONFIRMED", "signal": "ENTER SELL", "message": "Conferma ribassista su open, VWAP e momentum.", "alignment_score": -short_points}
+    if long_points >= 4 and bars >= 3:
+        return {"status": "INVALIDATED", "signal": "WAIT", "message": "Il flusso intraday contraddice il PRE-SELL.", "alignment_score": long_points}
+    return {"status": "WATCH", "signal": "SELL WATCH", "message": "Setup ribassista non ancora completo: attendi conferma.", "alignment_score": short_points - long_points}
 
 
 def confirm_open(ticker: str, pre: Dict) -> Dict:
@@ -172,67 +255,51 @@ def confirm_open(ticker: str, pre: Dict) -> Dict:
     state = intraday_state(ticker)
     if not status["is_open"]:
         return {"status": "WAIT_FOR_OPEN", "signal": "WAIT", "message": "Attendi la sessione regolare.", **state}
-    bars = int(state.get("bars", 0))
-    if bars < 1:
-        return {"status": "WAIT_FOR_OPEN", "signal": "WAIT", "message": "La prima barra 5m non è disponibile.", **state}
-
-    current = safe_float(state.get("current"))
-    opening = safe_float(state.get("open"))
-    vwap = safe_float(state.get("vwap"), opening)
-    ret15 = safe_float(state.get("ret15m"))
-    aligned_long = current > opening and current >= vwap and ret15 >= 0
-    aligned_short = current < opening and current <= vwap and ret15 <= 0
-
-    # Wait for two completed 5m bars (~10 minutes) before a hard confirmation.
-    if bars < 2:
-        return {"status": "CONFIRMING", "signal": pre["signal"], "message": "Aspetta 2 barre 5m complete.", **state}
-
-    if pre["signal"] == "PRE-BUY" and aligned_long:
-        return {"status": "CONFIRMED", "signal": "ENTER BUY", "message": "Conferma rialzista: prezzo sopra open e VWAP.", **state}
-    if pre["signal"] == "PRE-SELL" and aligned_short:
-        return {"status": "CONFIRMED", "signal": "ENTER SELL", "message": "Conferma ribassista: prezzo sotto open e VWAP.", **state}
-    if pre["signal"] in {"PRE-BUY", "PRE-SELL"}:
-        return {"status": "INVALIDATED", "signal": "WAIT", "message": "La conferma intraday contraddice il segnale pre-market.", **state}
-    return {"status": "WAIT", "signal": "WAIT", "message": "Nessuna conferma sufficiente.", **state}
+    logic = _confirmation_logic(pre.get("signal", "WAIT"), state)
+    return {**state, **logic}
 
 
-def trade_plan(ticker: str, pre: Dict, confirm: Dict, capital: float, risk_pct: float) -> Dict:
+def trade_plan(ticker: str, pre: Dict, confirm: Dict, capital: float, risk_pct: float, events: Dict) -> Dict:
     current = safe_float(confirm.get("current"), safe_float(pre.get("indicative")))
-    d = daily_features(fetch(ticker, "6mo", "1d"))
+    d = _completed_daily(ticker)
+    atr_value = safe_float(d["atr14"].iloc[-1], current * 0.01) if not d.empty else current * 0.01
     atr_pct = safe_float(d["atr_pct"].iloc[-1], 0.01) if not d.empty else 0.01
-    atr_pct = float(np.clip(atr_pct, 0.003, 0.12))
+    atr_pct = float(np.clip(atr_pct, 0.004, 0.08))
+    atr_value = max(atr_value, current * atr_pct)
+
     side = None
     if confirm.get("status") == "CONFIRMED" and confirm.get("signal") == "ENTER BUY":
         side = "LONG"
     elif confirm.get("status") == "CONFIRMED" and confirm.get("signal") == "ENTER SELL":
         side = "SHORT"
 
-    trigger_text = "Dopo 2 barre 5m complete, con prezzo sopra VWAP/open" if pre["signal"] == "PRE-BUY" else "Dopo 2 barre 5m complete, con prezzo sotto VWAP/open" if pre["signal"] == "PRE-SELL" else "Nessun trigger attivo"
-    if side is None:
+    trigger = (
+        "Attendi ENTER BUY: almeno 2 barre 5m, prezzo/open/VWAP/momentum allineati"
+        if pre.get("signal") == "PRE-BUY" else
+        "Attendi ENTER SELL: almeno 2 barre 5m, prezzo/open/VWAP/momentum allineati"
+        if pre.get("signal") == "PRE-SELL" else
+        "Nessun trigger attivo"
+    )
+    if side is None or current <= 0:
         return {
-            "status": "WAIT",
-            "action": "NON ENTRARE",
-            "side": None,
-            "entry": current,
-            "stop": current,
-            "target": current,
-            "rr": 0.0,
-            "shares": 0,
-            "risk_amount": 0.0,
-            "trigger": trigger_text,
-            "validity": "DAY: chiusura entro fine sessione o uscita anticipata se stop/target/cambio segnale.",
+            "status": "WAIT", "action": "NON ENTRARE", "side": None,
+            "entry": current, "stop": current, "target": current, "rr": 0.0,
+            "shares": 0, "risk_amount": 0.0, "trigger": trigger,
+            "entry_window": "Nessuna finestra di ingresso attiva",
+            "validity": "DAY: se confermato, uscita entro la chiusura salvo stop/target/invalidazione.",
+            "event_risk": events.get("event_risk", "NORMAL"),
         }
 
-    risk_per_share = current * atr_pct * 1.2
-    rr_target = 2.0
+    stop_distance = max(1.15 * atr_value, current * 0.005)
+    stop_distance = min(stop_distance, current * 0.08)
+    target_distance = stop_distance * DEFAULTS["target_rr"]
     if side == "LONG":
-        entry, stop, target = current, current - risk_per_share, current + risk_per_share * rr_target
-        action = "ENTER LONG NOW"
+        entry, stop, target, action = current, current - stop_distance, current + target_distance, "ENTER LONG"
     else:
-        entry, stop, target = current, current + risk_per_share, current - risk_per_share * rr_target
-        action = "ENTER SHORT NOW"
+        entry, stop, target, action = current, current + stop_distance, current - target_distance, "ENTER SHORT"
 
-    risk_budget = max(0.0, float(capital) * float(risk_pct))
+    event_factor = 0.5 if events.get("event_risk") == "HIGH" else 0.75 if events.get("event_risk") == "MEDIUM" else 1.0
+    risk_budget = max(0.0, float(capital) * float(risk_pct) * event_factor)
     shares_by_risk = math.floor(risk_budget / max(abs(entry - stop), 1e-9)) if risk_budget else 0
     max_notional = float(capital) * DEFAULTS["max_capital_fraction"]
     shares_by_capital = math.floor(max_notional / max(entry, 1e-9))
@@ -249,31 +316,37 @@ def trade_plan(ticker: str, pre: Dict, confirm: Dict, capital: float, risk_pct: 
         "rr": rr,
         "shares": shares,
         "risk_amount": min(risk_budget, shares * abs(entry - stop)),
-        "trigger": "Confermato: entrare sul prezzo corrente/next bar" if confirm.get("status") == "CONFIRMED" else trigger_text,
-        "validity": "DAY: uscita entro chiusura, salvo stop/target/cambio segnale.",
+        "trigger": "Conferma attiva: entra sul prezzo corrente/next 5m senza inseguire il prezzo",
+        "entry_window": "Valida finché il setup resta sopra/sotto VWAP e non si allontana > ~0.5 ATR dal trigger",
+        "validity": "DAY: uscita entro la chiusura, salvo stop/target o invalidazione precedente.",
+        "event_risk": events.get("event_risk", "NORMAL"),
     }
 
 
-def analyze_asset(ticker: str, capital: float = 10000.0, risk_pct: float = 0.01) -> Dict:
+def analyze_asset(ticker: str, capital: float = 10_000.0, risk_pct: float = 0.01, include_fundamentals: bool = True) -> Dict:
     t = ticker.strip().upper()
+    if not t:
+        raise ValueError("Inserisci un ticker")
     clock = market_status(t)
-    pre = premarket_analysis(t)
+    events = event_context(t)
+    regime = market_regime()
+    pre = premarket_analysis(t, events=events, regime=regime)
     intraday = intraday_state(t) if clock["is_open"] else None
-    if intraday:
-        day_base = {"p_up": pre["p_up"], "expected_return": pre["expected_return"]}
-        adjusted = _overlay_day(day_base, pre["gap"], pre["news_sentiment"], pre["regime"], intraday)
-        pre.update({k: adjusted[k] for k in ["signal", "p_up", "p_down", "expected_return", "confidence", "drivers"]})
+    if intraday and intraday.get("bars", 0) >= 2:
+        adjusted = _decision_overlay(pre, pre["gap"], events, regime, intraday)
+        pre.update({k: adjusted[k] for k in ["signal", "p_up", "p_down", "expected_return", "confidence", "decision_score", "drivers"]})
+        pre["score"] = round(pre["decision_score"], 1)
     confirm = confirm_open(t, pre)
-    plan = trade_plan(t, pre, confirm, capital, risk_pct)
+    plan = trade_plan(t, pre, confirm, capital, risk_pct, events)
 
     try:
         week = train_medium_model(t, "WEEK")
     except Exception as exc:
-        week = {"signal": "N/A", "p_up": 0.5, "p_down": 0.5, "expected_return": 0.0, "accuracy": 0.0, "brier": 0.0, "mae": 0.0, "error": str(exc)}
+        week = {"signal": "N/A", "p_up": 0.5, "p_down": 0.5, "expected_return": 0.0, "quality_score": 0.0, "error": str(exc)}
     try:
         month = train_medium_model(t, "MONTH")
     except Exception as exc:
-        month = {"signal": "N/A", "p_up": 0.5, "p_down": 0.5, "expected_return": 0.0, "accuracy": 0.0, "brier": 0.0, "mae": 0.0, "error": str(exc)}
+        month = {"signal": "N/A", "p_up": 0.5, "p_down": 0.5, "expected_return": 0.0, "quality_score": 0.0, "error": str(exc)}
 
     return {
         "ticker": t,
@@ -283,9 +356,11 @@ def analyze_asset(ticker: str, capital: float = 10000.0, risk_pct: float = 0.01)
         "plan": plan,
         "week": week,
         "month": month,
-        "news": news_context(t)["items"],
-        "fundamentals": current_fundamentals(t),
-        "regime": pre["regime"],
+        "events": events,
+        "news": events.get("news", {}).get("items", []),
+        "fundamentals": current_fundamentals(t) if include_fundamentals else {},
+        "regime": regime,
+        "macro": regime.get("macro", {}),
         "health": data_health(t),
-        "generated_at": datetime.now().isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
