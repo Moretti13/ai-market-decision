@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-APP_NAME = "AI Market Decision V7"
-APP_VERSION = "7.0.0"
-APP_BUILD = "V7-FINAL"
+APP_NAME = "AI Market Decision V7.1 Performance"
+APP_VERSION = "7.1.0"
+APP_BUILD = "V7.1-PERFORMANCE"
 
 US_STOCKS = [
     "NVDA", "AMD", "AVGO", "MSFT", "AMZN", "META", "GOOGL", "AAPL", "TSLA", "NFLX",
@@ -36,8 +36,8 @@ DEFAULTS = {
     "slippage_bps": 5.0,
     "commission_bps": 3.0,
     "refresh_seconds": 300,
-    "scanner_assets": 10,
-    "scanner_workers": 4,
+    "scanner_assets": 5,
+    "scanner_workers": 1,
     "buy_prob": 0.64,
     "sell_prob": 0.36,
     "day_min_edge": 0.0035,

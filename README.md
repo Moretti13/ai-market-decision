@@ -1,36 +1,66 @@
-# AI Market Decision V6
+# AI Market Decision V7.1 Performance
 
-Prototype quantitativo Streamlit per **DAY + WEEK + MONTH**.
+V7.1 è l'aggiornamento prestazionale della V7 per ridurre CPU e tempi di attesa su Streamlit Community Cloud senza congelare il mercato.
 
-## Cosa fa
-- **DAY**: modello storico open→close + gap overnight, news, regime; dopo l'apertura usa conferma su barre 5m e VWAP.
-- **WEEK**: modello ML separato su orizzonte di circa 5 sessioni.
-- **MONTH**: modello ML separato su orizzonte di circa 20 sessioni.
-- **Scanner**: analisi parallela su un universo di titoli/ETF.
-- **Backtest**: walk-forward sullo storico.
-- **Paper journal**: SQLite locale o PostgreSQL/Supabase tramite `DATABASE_URL`.
-- **Telegram**: alert opzionali tramite `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`.
-- **Auto-refresh**: `st.fragment(run_every=...)`, senza componenti aggiuntivi.
+## Cosa cambia davvero
+
+- **Training separato dall'inference**: DAY/WEEK/MONTH non vengono riaddestrati a ogni refresh.
+- **Retraining intelligente**: un modello viene riaddestrato quando cambia l'ultima barra daily completata usata dal modello.
+- **Dati live sempre aggiornabili**: gap, prezzo, barre 5m, VWAP, momentum e volume continuano a cambiare il segnale DAY durante la sessione.
+- **Cache modelli in memoria + disco locale**: i modelli già addestrati vengono riutilizzati nello stesso ambiente Streamlit. Se il container viene ricreato, il primo caricamento può richiedere un nuovo training.
+- **News/eventi cache 5 min**, **regime cache 10 min**, **macro cache 15 min**, **FRED cache 6h**, **fondamentali on-demand 6h**.
+- **Niente doppio download intraday** nella stessa analisi.
+- **ATR riutilizzato** dal contesto già calcolato, evitando un secondo calcolo dello storico.
+- **Scanner più prudente sulle risorse**: default 5 asset, 1 worker; il primo scan scalda la cache, i successivi sono più rapidi.
+- **Backtest resta manuale** e non parte durante il normale refresh.
+- **WAIT più pulito**: Entry/Stop/Target vengono mostrati come non disponibili invece di ripetere il prezzo corrente.
+- **Refresh automatico minimo 5 minuti** per evitare carico inutile.
+
+## Perché il mercato continua a essere considerato
+
+Il modello storico non viene congelato per sempre. Viene riaddestrato quando arriva nuova informazione daily completata. Durante la giornata, invece, la decisione DAY viene ricalcolata con input live: gap, prezzo, VWAP, momentum, volume, stato della sessione, regime ed eventi/news in cache breve.
+
+In pratica: **training raro, inference frequente**.
 
 ## Fonte dati
-Il prototipo usa Yahoo Finance tramite `yfinance`. La documentazione del progetto yfinance specifica che Yahoo Finance non è un feed professionale con SLA e che l'uso è destinato soprattutto a ricerca/uso personale. Per una versione realmente professionale bisogna sostituire il layer dati con un provider market-data con feed live e diritti d'uso adeguati.
 
-## Deploy Streamlit Cloud
-1. Metti `app.py`, `config.py`, `data_layer.py`, `market_clock.py`, `model_engine.py`, `signal_engine.py`, `scanner.py`, `db.py`, `alerts.py` e `requirements.txt` **alla root del repository**.
-2. In Streamlit Community Cloud scegli Python **3.12** e l'entrypoint `app.py`.
-3. Se vuoi persistenza cloud, inserisci `DATABASE_URL` nei Secrets, usando una connessione PostgreSQL/Supabase.
-4. Per Telegram aggiungi anche `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`.
+La build usa Yahoo Finance tramite `yfinance`. È adatta al collaudo e al paper trading, ma non equivale a un feed professionale con SLA e streaming garantito.
 
-## Secrets
-Esempio:
+## Installazione / Streamlit
 
-```toml
-DATABASE_URL = "postgresql://USER:PASSWORD@HOST:5432/DB"
-TELEGRAM_BOT_TOKEN = "..."
-TELEGRAM_CHAT_ID = "..."
+Consigliato Python **3.12**.
+
+```bash
+pip install -r requirements.txt
+python healthcheck.py
+python -m unittest discover -s tests -v
+streamlit run app.py
 ```
 
-Non committare mai `secrets.toml` nel repository.
+Su Streamlit Cloud:
 
-## Importante
-Questo software è un **supporto decisionale**, non una garanzia di profitto. Le probabilità sono output del modello; non sono certezze. Prima dell'uso con denaro reale è necessario eseguire paper trading e verificare risultati out-of-sample e costi reali.
+- repository: il tuo repository GitHub;
+- branch: `main`;
+- main file: `app.py`;
+- Python: `3.12`.
+
+## Test consigliato
+
+1. NVDA: attendi il primo caricamento.
+2. Premi `Ricalcola ora`: il secondo passaggio deve essere sensibilmente più rapido.
+3. AAPL e SPY: il primo caricamento crea le rispettive cache.
+4. Lascia il refresh automatico a 5 minuti.
+5. Scanner: inizialmente 3–5 asset.
+6. Backtest: avvialo solo manualmente.
+7. Paper trading prima di qualsiasi uso con capitale reale.
+
+## Verifiche del pacchetto
+
+- compilazione Python completa;
+- import di tutti i moduli core;
+- 8/8 test offline superati;
+- modello persistente con cache memory/disk;
+- nessun retraining dovuto al semplice refresh intraday;
+- Python target 3.12.
+
+V7.1 è la build consigliata per il test dell'architettura attuale. Non garantisce rendimenti e non invia ordini al broker.

@@ -8,6 +8,7 @@ import streamlit as st
 
 from alerts import send_telegram, telegram_configured
 from config import ALL_UNIVERSE, APP_BUILD, APP_NAME, APP_VERSION, DEFAULTS
+from data_layer import current_fundamentals
 from db import (
     all_positions,
     close_position,
@@ -18,7 +19,7 @@ from db import (
     recent_events,
     record_event_once,
 )
-from model_engine import walk_forward_backtest
+from model_engine import clear_model_cache, walk_forward_backtest
 from portfolio import monitor_open_positions, position_pnl
 from scanner import scanner
 from signal_engine import analyze_asset
@@ -27,14 +28,19 @@ from verification import store_analysis_predictions, verify_matured_predictions
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=50, show_spinner=False)
 def cached_analysis(ticker: str, capital: float, risk_pct: float, nonce: int = 0):
-    return analyze_asset(ticker, capital, risk_pct)
+    return analyze_asset(ticker, capital, risk_pct, include_fundamentals=False)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_verification(nonce: int = 0):
     return verify_matured_predictions()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_fundamentals(ticker: str):
+    return current_fundamentals(ticker)
 
 
 def pct(v) -> str:
@@ -63,7 +69,8 @@ def render_model_box(title: str, dat: dict):
     d.metric("Qualità modello", pct(dat.get("quality_score", 0.0)))
     st.caption(
         f"Accuracy {pct(dat.get('accuracy', 0.0))} · AUC {num(dat.get('auc', 0.5), 3)} · "
-        f"Brier {num(dat.get('brier', 0.25), 3)} · MAE {pct(dat.get('mae', 0.0))} · dati fino a {dat.get('data_asof', '—')}"
+        f"Brier {num(dat.get('brier', 0.25), 3)} · MAE {pct(dat.get('mae', 0.0))} · dati fino a {dat.get('data_asof', '—')} · "
+        f"cache {dat.get('cache_source', '—')}"
     )
 
 
@@ -168,7 +175,10 @@ def render_analysis(r: dict):
         st.caption("Nessuna news disponibile in questo aggiornamento.")
 
     with st.expander("🧾 Fondamentali correnti"):
-        f = r.get("fundamentals", {})
+        fund_key = f"fundamentals_{ticker}"
+        if st.button("Carica fondamentali", key=f"load_fund_{ticker}"):
+            st.session_state[fund_key] = cached_fundamentals(ticker)
+        f = st.session_state.get(fund_key, {})
         if f and "error" not in f:
             cols = [
                 "shortName", "sector", "industry", "marketCap", "trailingPE", "forwardPE",
@@ -176,8 +186,10 @@ def render_analysis(r: dict):
                 "debtToEquity", "freeCashflow", "averageVolume", "beta",
             ]
             st.dataframe(pd.DataFrame([{k: f[k] for k in cols if k in f}]), use_container_width=True, hide_index=True)
+        elif f.get("error"):
+            st.caption(f.get("error"))
         else:
-            st.caption(f.get("error", "Fondamentali non disponibili."))
+            st.caption("Caricamento on-demand per non rallentare il segnale live. Premi il pulsante solo quando vuoi consultare i fondamentali.")
 
     with st.expander("🩺 Data health / modello"):
         h = r.get("health", {})
@@ -190,6 +202,12 @@ def render_analysis(r: dict):
             "DAY accuracy": pre.get("model_accuracy"), "DAY AUC": pre.get("model_auc"),
             "DAY Brier": pre.get("model_brier"), "DAY quality": pre.get("quality_score"),
             "DAY data_asof": pre.get("model_data_asof"),
+            "DAY trained_at": pre.get("model_trained_at"),
+            "DAY cache": pre.get("model_cache_source"),
+            "WEEK trained_at": r.get("week", {}).get("trained_at"),
+            "WEEK cache": r.get("week", {}).get("cache_source"),
+            "MONTH trained_at": r.get("month", {}).get("trained_at"),
+            "MONTH cache": r.get("month", {}).get("cache_source"),
         })
         st.caption("Fonte attuale: Yahoo Finance/yfinance, adatta al test del prototipo ma non equivalente a un feed professionale con SLA.")
 
@@ -198,17 +216,17 @@ def render_analysis(r: dict):
         if record_event_once(
             event_key, ticker, "DAY", confirm.get("signal", ""),
             plan.get("entry", 0.0), plan.get("stop", 0.0), plan.get("target", 0.0),
-            notes="V7 confirmed DAY signal",
+            notes="V7.1 confirmed DAY signal",
         ):
             send_telegram(
-                f"AI Market Decision V7\n{ticker} DAY\n{confirm.get('signal')}\n"
+                f"AI Market Decision V7.1\n{ticker} DAY\n{confirm.get('signal')}\n"
                 f"Entry {plan.get('entry', 0):.2f}\nStop {plan.get('stop', 0):.2f}\nTarget {plan.get('target', 0):.2f}\n"
                 f"P(up) {pre.get('p_up', .5)*100:.1f}%\nEvent risk {pre.get('event_risk')}"
             )
 
 
-st.title("📈 AI Market Decision V7")
-st.caption("DAY + WEEK + MONTH · ensemble ML · news/eventi · macro/regime · scanner · walk-forward · verifica automatica · paper positions")
+st.title("📈 AI Market Decision V7.1 Performance")
+st.caption("DAY + WEEK + MONTH · modelli persistenti · live inference · news/eventi · macro/regime · scanner · walk-forward · paper positions")
 
 with st.sidebar:
     st.header("Impostazioni")
@@ -219,7 +237,7 @@ with st.sidebar:
         value=float(DEFAULTS["risk_pct"] * 100), step=0.1,
     ) / 100
     auto = st.toggle("Ricalcolo automatico", value=True)
-    refresh_minutes = st.selectbox("Intervallo", [1, 5, 10], index=1, disabled=not auto)
+    refresh_minutes = st.selectbox("Intervallo", [5, 10, 15], index=0, disabled=not auto)
     if st.button("🔄 Ricalcola ora", type="primary"):
         st.session_state["refresh_nonce"] = int(st.session_state.get("refresh_nonce", 0)) + 1
         st.session_state.pop("analysis_key", None)
@@ -230,7 +248,7 @@ nonce = int(st.session_state.get("refresh_nonce", 0))
 cache_key = f"{ticker}|{capital:.2f}|{risk_pct:.5f}|{nonce}"
 if st.session_state.get("analysis_key") != cache_key:
     try:
-        with st.spinner(f"Analisi {ticker}: DAY / WEEK / MONTH + eventi + macro..."):
+        with st.spinner(f"Analisi {ticker}: live + modelli DAY/WEEK/MONTH..."):
             result = cached_analysis(ticker, capital, risk_pct, nonce)
         st.session_state["analysis"] = result
         st.session_state["analysis_key"] = cache_key
@@ -267,11 +285,11 @@ tabs = st.tabs(["🔎 Scanner", "📊 Backtest", "✅ Verifica previsioni", "�
 with tabs[0]:
     st.subheader("Market Scanner V7")
     c1, c2, c3 = st.columns(3)
-    scan_n = c1.slider("Numero asset", 5, min(25, len(ALL_UNIVERSE)), int(DEFAULTS["scanner_assets"]))
+    scan_n = c1.slider("Numero asset", 3, min(15, len(ALL_UNIVERSE)), int(DEFAULTS["scanner_assets"]))
     horizon_view = c2.selectbox("Vista", ["DAY", "WEEK", "MONTH"])
     side_view = c3.selectbox("Segnali", ["TUTTI", "BUY", "SELL"])
     if st.button("🚀 Scansiona mercato", type="primary"):
-        with st.spinner("Scansione parallela... può richiedere alcuni minuti con Yahoo Finance."):
+        with st.spinner("Scansione controllata... il primo passaggio crea la cache dei modelli; i successivi sono più rapidi."):
             st.session_state["scan_df_v7"] = scanner(ALL_UNIVERSE, scan_n)
     df = st.session_state.get("scan_df_v7")
     if isinstance(df, pd.DataFrame) and not df.empty:
@@ -334,7 +352,7 @@ with tabs[3]:
     for ev in monitor.get("events", []):
         key = f"V7|POSITION|{ev['id']}|{ev['reason']}"
         if record_event_once(key, ev["ticker"], "POSITION", ev["reason"], ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}"):
-            send_telegram(f"AI Market Decision V7\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
+            send_telegram(f"AI Market Decision V7.1\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
     if monitor.get("errors"):
         st.warning(monitor["errors"])
 
@@ -345,7 +363,7 @@ with tabs[3]:
         if st.button("➕ Registra piano come PAPER POSITION"):
             pid = open_position(
                 ticker, "DAY", plan["side"], int(plan["shares"]), float(plan["entry"]),
-                float(plan["stop"]), float(plan["target"]), notes="V7 current DAY plan",
+                float(plan["stop"]), float(plan["target"]), notes="V7.1 current DAY plan",
             )
             st.success(f"Paper position registrata (ID {pid}).")
     else:
@@ -360,7 +378,7 @@ with tabs[3]:
         ms = st.number_input("Stop", min_value=0.0, value=max(0.0, float(plan.get("stop", 0.0) or 0.0)), key="ms")
         mt = st.number_input("Target", min_value=0.0, value=max(0.0, float(plan.get("target", 0.0) or 0.0)), key="mt")
         if st.button("Salva posizione manuale"):
-            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7 manual paper position")
+            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7.1 manual paper position")
             st.success(f"Posizione {pid} salvata.")
 
     open_df = open_positions()
@@ -388,14 +406,21 @@ with tabs[4]:
         "data_source": "Yahoo Finance via yfinance",
         "database": "PostgreSQL se DATABASE_URL è configurato, altrimenti SQLite locale",
     })
+    st.info("V7.1 separa training e inference: i modelli vengono riutilizzati finché non arriva una nuova barra daily completata; prezzo/gap/5m/VWAP/news continuano ad aggiornare il segnale.")
+    if st.button("🧠 Forza retraining modelli del ticker"):
+        removed = clear_model_cache(ticker)
+        cached_analysis.clear()
+        st.session_state.pop("analysis_key", None)
+        st.success(f"Cache modelli di {ticker} azzerata ({removed} file). Al prossimo ricalcolo verranno riaddestrati.")
+
     if st.button("📨 Test Telegram"):
-        if send_telegram("AI Market Decision V7 — test alert OK"):
+        if send_telegram("AI Market Decision V7.1 — test alert OK"):
             st.success("Messaggio Telegram inviato.")
         else:
             st.warning("Telegram non configurato o invio fallito. Controlla TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nei Secrets.")
     st.markdown(
         """
-        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7 non invia ordini e non garantisce profitti.\n\n
+        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7.1 non invia ordini e non garantisce profitti.\n\n
         **Short:** ENTER SELL/SHORT richiede un conto che consenta la vendita allo scoperto; altrimenti interpreta SELL come uscita/avoid.\n\n
         **Persistenza:** su Streamlit Cloud usa PostgreSQL/Supabase tramite `DATABASE_URL`; il filesystem locale può essere ricreato nei redeploy.
         """
@@ -407,7 +432,7 @@ payload = json.dumps(st.session_state["analysis"], default=str, ensure_ascii=Fal
 st.download_button(
     "⬇️ Esporta analisi JSON",
     data=payload.encode("utf-8"),
-    file_name=f"{ticker}_analysis_v7.json",
+    file_name=f"{ticker}_analysis_v7_1.json",
     mime="application/json",
 )
 st.caption(f"AI Market Decision V{APP_VERSION} · {APP_BUILD} · refresh {refresh_minutes if auto else 'manuale'} min")

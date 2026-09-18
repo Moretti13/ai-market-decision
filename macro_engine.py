@@ -16,11 +16,12 @@ except Exception:
 from data_layer import daily_features, fetch, safe_float
 
 _FRED_CACHE: dict[str, tuple[float, dict]] = {}
+_MACRO_CACHE: tuple[float, dict] | None = None
 
 
 def _fred_series(series_id: str) -> Dict:
     now = time.time()
-    if series_id in _FRED_CACHE and now - _FRED_CACHE[series_id][0] < 3600:
+    if series_id in _FRED_CACHE and now - _FRED_CACHE[series_id][0] < 21600:
         return _FRED_CACHE[series_id][1]
     result = {"value": None, "previous": None, "date": None}
     if requests is None:
@@ -44,7 +45,11 @@ def _fred_series(series_id: str) -> Dict:
     return result
 
 
-def macro_snapshot() -> Dict:
+def macro_snapshot(force: bool = False) -> Dict:
+    global _MACRO_CACHE
+    cache_now = time.time()
+    if not force and _MACRO_CACHE is not None and cache_now - _MACRO_CACHE[0] < 900:
+        return dict(_MACRO_CACHE[1])
     out = {
         "vix": None, "vix_change": 0.0, "tnx": None, "tnx_change": 0.0,
         "dxy_change_5d": 0.0, "oil_change_5d": 0.0, "gold_change_5d": 0.0,
@@ -95,4 +100,5 @@ def macro_snapshot() -> Dict:
     score = float(np.clip(score, -100, 100))
     out["score"] = score
     out["risk_label"] = "RISK-OFF" if score <= -25 else "RISK-ON" if score >= 20 else "NEUTRAL"
+    _MACRO_CACHE = (cache_now, dict(out))
     return out

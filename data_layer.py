@@ -77,12 +77,16 @@ def normalize_ohlcv(df: pd.DataFrame, daily: bool = False) -> pd.DataFrame:
 
 
 _CACHE: Dict[Tuple[str, str, str, bool], Tuple[float, pd.DataFrame]] = {}
-_CACHE_TTL = {"1d": 300.0, "5m": 35.0, "15m": 60.0, "30m": 90.0, "1h": 120.0}
+_CACHE_TTL = {"1d": 1800.0, "5m": 35.0, "15m": 60.0, "30m": 90.0, "1h": 120.0}
 
 
 def clear_cache() -> None:
     global _BENCH_CACHE
     _CACHE.clear()
+    _NEWS_RAW_CACHE.clear() if "_NEWS_RAW_CACHE" in globals() else None
+    _FUND_CACHE.clear() if "_FUND_CACHE" in globals() else None
+    _EARNINGS_CACHE.clear() if "_EARNINGS_CACHE" in globals() else None
+    _HEALTH_CACHE.clear() if "_HEALTH_CACHE" in globals() else None
     _BENCH_CACHE = None
 
 
@@ -214,13 +218,13 @@ _BENCH_LOCK = threading.Lock()
 def benchmark_features(start: pd.Timestamp, end: Optional[pd.Timestamp] = None) -> pd.DataFrame:
     global _BENCH_CACHE
     now = time_module.time()
-    if _BENCH_CACHE is not None and now - _BENCH_CACHE[0] < 300:
+    if _BENCH_CACHE is not None and now - _BENCH_CACHE[0] < 900:
         full = _BENCH_CACHE[1]
     else:
         # Scanner threads share one benchmark build instead of hammering the provider.
         with _BENCH_LOCK:
             now = time_module.time()
-            if _BENCH_CACHE is not None and now - _BENCH_CACHE[0] < 300:
+            if _BENCH_CACHE is not None and now - _BENCH_CACHE[0] < 900:
                 full = _BENCH_CACHE[1]
             else:
                 frames = []
@@ -321,7 +325,19 @@ def intraday_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return x.replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
+_NEWS_RAW_CACHE: Dict[Tuple[str, int], Tuple[float, List[Dict]]] = {}
+_FUND_CACHE: Dict[str, Tuple[float, Dict]] = {}
+_EARNINGS_CACHE: Dict[str, Tuple[float, Dict]] = {}
+_HEALTH_CACHE: Dict[str, Tuple[float, Dict]] = {}
+
+
 def raw_news(ticker: str, limit: int = 20) -> List[Dict]:
+    ticker = ticker.strip().upper()
+    key = (ticker, int(limit))
+    now = time_module.time()
+    cached = _NEWS_RAW_CACHE.get(key)
+    if cached and now - cached[0] < 300:
+        return [dict(x) for x in cached[1]]
     if yf is None:
         return []
     results: List[Dict] = []
@@ -354,10 +370,17 @@ def raw_news(ticker: str, limit: int = 20) -> List[Dict]:
                 })
         except Exception:
             pass
-    return results[:limit]
+    final = results[:limit]
+    _NEWS_RAW_CACHE[key] = (now, [dict(x) for x in final])
+    return final
 
 
 def current_fundamentals(ticker: str) -> Dict:
+    ticker = ticker.strip().upper()
+    now = time_module.time()
+    cached = _FUND_CACHE.get(ticker)
+    if cached and now - cached[0] < 21600:
+        return dict(cached[1])
     fields = [
         "shortName", "sector", "industry", "marketCap", "trailingPE", "forwardPE", "pegRatio",
         "priceToSalesTrailing12Months", "returnOnEquity", "returnOnAssets", "profitMargins",
@@ -375,10 +398,16 @@ def current_fundamentals(ticker: str) -> Dict:
                 out[field] = val
     except Exception as exc:
         out["error"] = str(exc)
+    _FUND_CACHE[ticker] = (now, dict(out))
     return out
 
 
 def earnings_context(ticker: str) -> Dict:
+    ticker = ticker.strip().upper()
+    now_ts = time_module.time()
+    cached = _EARNINGS_CACHE.get(ticker)
+    if cached and now_ts - cached[0] < 7200:
+        return dict(cached[1])
     result = {"next_earnings": None, "days_to_earnings": None, "source": "Yahoo Finance"}
     if yf is None:
         return result
@@ -396,6 +425,7 @@ def earnings_context(ticker: str) -> Dict:
                     nxt = min(parsed)
                     result["next_earnings"] = nxt.isoformat()
                     result["days_to_earnings"] = int(np.floor((nxt - now).total_seconds() / 86400))
+                    _EARNINGS_CACHE[ticker] = (now_ts, dict(result))
                     return result
     except Exception:
         pass
@@ -410,6 +440,7 @@ def earnings_context(ticker: str) -> Dict:
                 result["days_to_earnings"] = int(np.floor((nxt - now).total_seconds() / 86400))
     except Exception:
         pass
+    _EARNINGS_CACHE[ticker] = (now_ts, dict(result))
     return result
 
 
@@ -429,7 +460,12 @@ def quote_snapshot(ticker: str) -> Dict:
     return {"price": safe_float(daily["Close"].iloc[-1]), "asof": str(daily.index[-1]), "source": "1d", "market_status": status["status"]}
 
 
-def data_health(ticker: str) -> Dict:
+def data_health(ticker: str, force: bool = False) -> Dict:
+    ticker = ticker.strip().upper()
+    now = time_module.time()
+    cached = _HEALTH_CACHE.get(ticker)
+    if not force and cached and now - cached[0] < 300:
+        return dict(cached[1])
     health = {
         "ticker": ticker,
         "daily_bars": 0,
@@ -463,4 +499,5 @@ def data_health(ticker: str) -> Dict:
         health["status"] = "PARTIAL"
     else:
         health["status"] = "ERROR"
+    _HEALTH_CACHE[ticker] = (now, dict(health))
     return health

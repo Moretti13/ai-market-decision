@@ -25,7 +25,7 @@ from regime_engine import market_regime
 
 
 def _completed_daily(ticker: str) -> pd.DataFrame:
-    d = daily_features(fetch(ticker, "7y", "1d"))
+    d = daily_features(fetch(ticker, "2y", "1d"))
     if d.empty:
         return d
     status = market_status(ticker)
@@ -165,6 +165,10 @@ def premarket_analysis(ticker: str, events: Dict | None = None, regime: Dict | N
         "model_note": model.get("model_note", ""),
         "model_error": model.get("error"),
         "model_data_asof": model.get("data_asof", str(d.index[-1])),
+        "model_trained_at": model.get("trained_at"),
+        "model_cache_source": model.get("cache_source", "UNKNOWN"),
+        "atr14": safe_float(d["atr14"].iloc[-1], prev_close * 0.01),
+        "atr_pct": safe_float(d["atr_pct"].iloc[-1], 0.01),
         "event_risk": events.get("event_risk", "NORMAL"),
         "catalyst": events.get("catalyst", "NONE"),
         "news_sentiment": safe_float(events.get("news", {}).get("sentiment")),
@@ -215,7 +219,7 @@ def _confirmation_logic(pre_signal: str, state: Dict, min_bars: int | None = Non
     if bars < min_bars:
         return {"status": "CONFIRMING", "signal": pre_signal, "message": f"Attendi almeno {min_bars} barre 5m complete.", "alignment_score": 0}
     if pre_signal not in {"PRE-BUY", "PRE-SELL"}:
-        return {"status": "WAIT", "signal": "WAIT", "message": "Nessun vantaggio pre-sessione sufficiente.", "alignment_score": 0}
+        return {"status": "WAIT", "signal": "WAIT", "message": "Nessun vantaggio operativo sufficiente.", "alignment_score": 0}
 
     current = safe_float(state.get("current"))
     opening = safe_float(state.get("open"), current)
@@ -250,9 +254,9 @@ def _confirmation_logic(pre_signal: str, state: Dict, min_bars: int | None = Non
     return {"status": "WATCH", "signal": "SELL WATCH", "message": "Setup ribassista non ancora completo: attendi conferma.", "alignment_score": short_points - long_points}
 
 
-def confirm_open(ticker: str, pre: Dict) -> Dict:
+def confirm_open(ticker: str, pre: Dict, state: Dict | None = None) -> Dict:
     status = market_status(ticker)
-    state = intraday_state(ticker)
+    state = state if state is not None else intraday_state(ticker)
     if not status["is_open"]:
         return {"status": "WAIT_FOR_OPEN", "signal": "WAIT", "message": "Attendi la sessione regolare.", **state}
     logic = _confirmation_logic(pre.get("signal", "WAIT"), state)
@@ -261,9 +265,8 @@ def confirm_open(ticker: str, pre: Dict) -> Dict:
 
 def trade_plan(ticker: str, pre: Dict, confirm: Dict, capital: float, risk_pct: float, events: Dict) -> Dict:
     current = safe_float(confirm.get("current"), safe_float(pre.get("indicative")))
-    d = _completed_daily(ticker)
-    atr_value = safe_float(d["atr14"].iloc[-1], current * 0.01) if not d.empty else current * 0.01
-    atr_pct = safe_float(d["atr_pct"].iloc[-1], 0.01) if not d.empty else 0.01
+    atr_value = safe_float(pre.get("atr14"), current * 0.01)
+    atr_pct = safe_float(pre.get("atr_pct"), 0.01)
     atr_pct = float(np.clip(atr_pct, 0.004, 0.08))
     atr_value = max(atr_value, current * atr_pct)
 
@@ -283,7 +286,7 @@ def trade_plan(ticker: str, pre: Dict, confirm: Dict, capital: float, risk_pct: 
     if side is None or current <= 0:
         return {
             "status": "WAIT", "action": "NON ENTRARE", "side": None,
-            "entry": current, "stop": current, "target": current, "rr": 0.0,
+            "entry": None, "stop": None, "target": None, "rr": 0.0,
             "shares": 0, "risk_amount": 0.0, "trigger": trigger,
             "entry_window": "Nessuna finestra di ingresso attiva",
             "validity": "DAY: se confermato, uscita entro la chiusura salvo stop/target/invalidazione.",
@@ -336,7 +339,7 @@ def analyze_asset(ticker: str, capital: float = 10_000.0, risk_pct: float = 0.01
         adjusted = _decision_overlay(pre, pre["gap"], events, regime, intraday)
         pre.update({k: adjusted[k] for k in ["signal", "p_up", "p_down", "expected_return", "confidence", "decision_score", "drivers"]})
         pre["score"] = round(pre["decision_score"], 1)
-    confirm = confirm_open(t, pre)
+    confirm = confirm_open(t, pre, intraday if intraday is not None else None)
     plan = trade_plan(t, pre, confirm, capital, risk_pct, events)
 
     try:

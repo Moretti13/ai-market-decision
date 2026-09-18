@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Dict
 
 import numpy as np
@@ -7,8 +8,14 @@ import numpy as np
 from data_layer import daily_features, fetch, safe_float
 from macro_engine import macro_snapshot
 
+_REGIME_CACHE: tuple[float, Dict] | None = None
 
-def market_regime() -> Dict:
+
+def market_regime(force: bool = False) -> Dict:
+    global _REGIME_CACHE
+    now = time.time()
+    if not force and _REGIME_CACHE is not None and now - _REGIME_CACHE[0] < 600:
+        return dict(_REGIME_CACHE[1])
     try:
         spy = daily_features(fetch("SPY", "5y", "1d"))
         qqq = daily_features(fetch("QQQ", "5y", "1d"))
@@ -49,7 +56,7 @@ def market_regime() -> Dict:
             regime = "MILD DOWN / NEUTRAL"
         else:
             regime = "NEUTRAL"
-        return {
+        result = {
             "regime": regime,
             "score": score,
             "spy20": safe_float(spy["ret20"].iloc[-1]),
@@ -58,10 +65,13 @@ def market_regime() -> Dict:
             "vix": vix_last,
             "realized_vol": realized,
             "macro": macro,
+            "cache_age_seconds": 0,
         }
     except Exception as exc:
-        return {
+        result = {
             "regime": "UNKNOWN", "score": 0.0, "spy20": 0.0, "qqq20": 0.0,
             "iwm20": 0.0, "vix": 20.0, "realized_vol": 0.0,
-            "macro": macro_snapshot(), "error": str(exc),
+            "macro": macro_snapshot(), "error": str(exc), "cache_age_seconds": 0,
         }
+    _REGIME_CACHE = (now, dict(result))
+    return result

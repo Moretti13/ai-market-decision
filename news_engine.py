@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from datetime import datetime, timezone
 from typing import Dict, List
 
@@ -22,6 +23,8 @@ NEGATIVE = {
     "lawsuit": -0.6, "recall": -0.8, "investigation": -0.8, "tariff": -0.5,
     "guidance cut": -1.0, "revenue miss": -1.0, "earnings miss": -1.0,
 }
+
+_NEWS_INTEL_CACHE: dict[tuple[str, int], tuple[float, Dict]] = {}
 
 CATEGORY_TERMS = {
     "EARNINGS": ["earnings", "eps", "revenue", "quarter", "guidance", "profit"],
@@ -88,7 +91,13 @@ def score_title(title: str) -> Dict:
     }
 
 
-def news_intelligence(ticker: str, limit: int = 20) -> Dict:
+def news_intelligence(ticker: str, limit: int = 20, force: bool = False) -> Dict:
+    ticker = ticker.strip().upper()
+    key = (ticker, int(limit))
+    cache_now = time.time()
+    cached = _NEWS_INTEL_CACHE.get(key)
+    if not force and cached and cache_now - cached[0] < 300:
+        return dict(cached[1])
     raw = raw_news(ticker, limit=limit)
     now = pd.Timestamp.now(tz="UTC")
     seen = set()
@@ -125,7 +134,7 @@ def news_intelligence(ticker: str, limit: int = 20) -> Dict:
         for cat in item["categories"]:
             category_counts[cat] = category_counts.get(cat, 0) + 1
     top_category = max(category_counts, key=category_counts.get) if category_counts else "NONE"
-    return {
+    result = {
         "ticker": ticker,
         "items": enriched,
         "count": len(enriched),
@@ -135,3 +144,5 @@ def news_intelligence(ticker: str, limit: int = 20) -> Dict:
         "top_category": top_category,
         "method": "rule-based recency/importance scoring",
     }
+    _NEWS_INTEL_CACHE[key] = (cache_now, dict(result))
+    return result

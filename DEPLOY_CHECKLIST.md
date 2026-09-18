@@ -1,82 +1,49 @@
-# Deploy Checklist V7
+# Deploy Checklist V7.1 Performance
 
-## 1. GitHub
+## GitHub
 
-Carica nella root del repository:
+Carica i file V7.1 nella **root** del repository, sostituendo quelli V7 con lo stesso nome. `app.py` deve restare direttamente nella root.
+
+File principali da aggiornare:
 
 - `app.py`
 - `config.py`
 - `data_layer.py`
-- `news_engine.py`
-- `macro_engine.py`
-- `regime_engine.py`
-- `events_engine.py`
 - `model_engine.py`
 - `signal_engine.py`
 - `scanner.py`
-- `verification.py`
-- `portfolio.py`
-- `db.py`
-- `alerts.py`
-- `healthcheck.py`
+- `news_engine.py`
+- `events_engine.py`
+- `macro_engine.py`
+- `regime_engine.py`
 - `requirements.txt`
-- `runtime.txt`
-- `.python-version`
-- `.streamlit/config.toml`
-- `tests/`
+- `README.md`
 
-Non creare `ai-market-decision/ai_market_decision_v7/app.py`: `app.py` deve restare direttamente nella root.
+Gli altri file V7 possono restare invariati.
 
-## 2. Streamlit
-
-Impostazioni app:
+## Streamlit
 
 - Branch: `main`
-- Main file path: `app.py`
-- Python: preferibilmente `3.12`
+- Main file: `app.py`
+- Python: **3.12**
 
-Dopo il commit, fai reboot/redeploy.
+Dopo il commit Streamlit dovrebbe ridistribuire automaticamente. Se non lo fa, usa Reboot app.
 
-## 3. Primo avvio
+## Primo test
 
-Nei log cerca:
+1. Disattiva temporaneamente il refresh automatico se Streamlit è ancora sotto throttle.
+2. Apri NVDA e attendi il primo training.
+3. Premi `Ricalcola ora`: non deve riaddestrare i modelli se l'ultima barra daily completata non è cambiata.
+4. In `Data health / modello` controlla `DAY cache`, `WEEK cache`, `MONTH cache`: dopo il primo training dovresti vedere `MEMORY` o `DISK` nei ricalcoli successivi.
+5. Prova AAPL e SPY.
+6. Riattiva refresh automatico a 5 minuti.
+7. Scanner: iniziare con 3–5 asset.
+8. Backtest: eseguirlo manualmente, non durante lo scanner.
 
-- installazione dipendenze completata;
-- nessun `Traceback`;
-- server Streamlit avviato.
+## Come verificare che il cambiamento di mercato venga ancora considerato
 
-Se il deploy usa Python 3.14, i range nel `requirements.txt` permettono a pip/uv di scegliere release compatibili. Se hai la possibilità di selezionare 3.12, usa 3.12 per coerenza con i test del progetto.
+Durante la sessione il prezzo/VWAP/momentum/volume devono continuare ad aggiornarsi. Il campo `trained_at` può restare uguale: è corretto. Il segnale DAY può cambiare anche senza nuovo training perché cambia l'inference live.
 
-## 4. Test funzionale
+## Nota cache
 
-Esegui in ordine:
-
-1. `NVDA`: verifica DAY/WEEK/MONTH.
-2. `AAPL`: verifica un secondo titolo.
-3. `SPY`: verifica ETF/benchmark.
-4. Scanner su 5 asset.
-5. Backtest DAY con 20 finestre.
-6. Backtest WEEK con 20 finestre.
-7. Tab Verifica previsioni: controlla che lo storico venga salvato.
-8. Posizioni: registra una paper position e verifica mark-to-market.
-
-## 5. Database persistente (consigliato dopo il test base)
-
-Aggiungi nei Secrets:
-
-```toml
-DATABASE_URL = "postgresql://USER:PASSWORD@HOST:5432/DB"
-```
-
-## 6. Telegram (opzionale)
-
-```toml
-TELEGRAM_BOT_TOKEN = "..."
-TELEGRAM_CHAT_ID = "..."
-```
-
-Poi usa il pulsante `Test Telegram` nella tab Sistema.
-
-## 7. Prima del denaro reale
-
-Non saltare questa fase: accumula paper trades e previsioni maturate, verifica accuracy/edge out-of-sample e confronta i risultati con costi/slippage reali. La qualità del dato Yahoo Finance è sufficiente per testare il flusso, non per dichiarare esecuzione istituzionale.
+La cache su disco è locale al container Streamlit. Dopo un redeploy/sleep profondo la piattaforma può ricreare il filesystem e il primo caricamento può riaddestrare i modelli. Non è un errore.
