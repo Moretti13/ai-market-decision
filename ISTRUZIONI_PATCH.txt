@@ -1,0 +1,18 @@
+PATCH V7.2 STABILITY
+
+1) Estrai V7_2_PATCH.zip.
+2) Nel repository GitHub Moretti13/ai-market-decision vai su Add file -> Upload files.
+3) Carica nella ROOT questi file (sostituendo quelli esistenti):
+   app.py
+   config.py
+   data_layer.py
+   market_clock.py
+   signal_engine.py
+   tests/test_core.py (opzionale per il deploy, consigliato nel repository)
+4) Puoi caricare anche PATCH_NOTES_V7_2.md.
+5) Commit message consigliato: Upgrade V7.2 Stability
+6) Non cambiare Python: resta 3.12.
+7) Streamlit dovrebbe redeployare da solo. Se non lo fa: Manage app -> Reboot.
+8) Verifica in basso a sinistra: V7.2-STABILITY.
+9) Lascia Ricalcolo automatico OFF per il primo test.
+10) Testa SPY/NVDA/AAPL. Nei weekend SPY deve essere CLOSED; in un giorno di mercato tra 04:00 e 09:30 ET deve essere PRE-MARKET.

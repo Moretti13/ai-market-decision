@@ -256,9 +256,40 @@ def _confirmation_logic(pre_signal: str, state: Dict, min_bars: int | None = Non
 
 def confirm_open(ticker: str, pre: Dict, state: Dict | None = None) -> Dict:
     status = market_status(ticker)
-    state = state if state is not None else intraday_state(ticker)
+
+    # Important performance guard: outside the regular session we do not fetch
+    # regular-session 5m bars only to discover that confirmation is impossible.
+    # Premarket pricing is already carried by ``pre`` through _live_gap().
     if not status["is_open"]:
-        return {"status": "WAIT_FOR_OPEN", "signal": "WAIT", "message": "Attendi la sessione regolare.", **state}
+        current = safe_float(pre.get("indicative"), safe_float(pre.get("prev_close")))
+        if status.get("is_pre"):
+            state_name = "WAIT_FOR_OPEN"
+            message = "Premarket attivo: prepara il setup, ma la conferma operativa parte dalla sessione regolare."
+        elif status.get("is_post"):
+            state_name = "AFTER-HOURS"
+            message = "Sessione regolare terminata: nessun nuovo ingresso DAY; prepara la prossima sessione."
+        else:
+            state_name = "CLOSED"
+            reason = status.get("closed_reason") or "mercato chiuso"
+            message = f"Mercato chiuso ({reason.lower()}): nessuna conferma 5m finché non riapre la sessione regolare."
+        return {
+            **status,
+            "status": state_name,
+            "signal": "WAIT",
+            "message": message,
+            "bars": 0,
+            "current": current,
+            "vwap": current,
+            "ret5m": 0.0,
+            "ret15m": 0.0,
+            "ret30m": 0.0,
+            "ret60m": 0.0,
+            "session_ret": 0.0,
+            "volume_ratio": 1.0,
+            "or_pos": 0.5,
+        }
+
+    state = state if state is not None else intraday_state(ticker)
     logic = _confirmation_logic(pre.get("signal", "WAIT"), state)
     return {**state, **logic}
 
@@ -364,6 +395,6 @@ def analyze_asset(ticker: str, capital: float = 10_000.0, risk_pct: float = 0.01
         "fundamentals": current_fundamentals(t) if include_fundamentals else {},
         "regime": regime,
         "macro": regime.get("macro", {}),
-        "health": data_health(t),
+        "health": data_health(t, live=bool(clock.get("is_open") or clock.get("is_pre"))),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

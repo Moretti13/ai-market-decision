@@ -14,10 +14,10 @@ sys.path.insert(0, str(ROOT))
 
 from config import MODEL_FEATURES  # noqa: E402
 from data_layer import daily_features, safe_float  # noqa: E402
-from market_clock import session_hours  # noqa: E402
+from market_clock import market_status, session_hours  # noqa: E402
 from model_engine import _backtest_frame, _train_predict  # noqa: E402
 from news_engine import score_title  # noqa: E402
-from signal_engine import _confirmation_logic  # noqa: E402
+from signal_engine import _confirmation_logic, confirm_open  # noqa: E402
 from portfolio import position_pnl  # noqa: E402
 
 
@@ -50,6 +50,32 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(str(tz), "America/New_York")
         self.assertEqual((op.hour, op.minute), (9, 30))
         self.assertEqual((cl.hour, cl.minute), (16, 0))
+
+
+    def test_market_status_weekend_and_premarket(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        weekend = market_status("SPY", datetime(2026, 9, 19, 6, 25, tzinfo=ny))
+        self.assertEqual(weekend["status"], "CLOSED")
+        self.assertEqual(weekend["closed_reason"], "WEEKEND")
+        friday = market_status("SPY", datetime(2026, 9, 18, 6, 25, tzinfo=ny))
+        self.assertEqual(friday["status"], "PRE-MARKET")
+        self.assertTrue(friday["is_pre"])
+
+    def test_confirm_open_does_not_fetch_intraday_when_closed(self):
+        from unittest.mock import patch
+        closed = {
+            "status": "CLOSED", "is_open": False, "is_pre": False, "is_post": False,
+            "closed_reason": "WEEKEND", "timezone": None, "now": pd.Timestamp("2026-09-19"),
+            "open": pd.Timestamp("09:30").time(), "close": pd.Timestamp("16:00").time(),
+            "is_session_day": False, "next_event": "NEXT SESSION",
+        }
+        pre = {"signal": "WAIT", "indicative": 100.0, "prev_close": 100.0}
+        with patch("signal_engine.market_status", return_value=closed), patch("signal_engine.intraday_state") as intraday_mock:
+            out = confirm_open("SPY", pre)
+            self.assertEqual(out["status"], "CLOSED")
+            intraday_mock.assert_not_called()
 
     def test_news_score(self):
         pos = score_title("Company beats earnings and raises guidance")

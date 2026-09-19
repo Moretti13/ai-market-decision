@@ -447,25 +447,36 @@ def earnings_context(ticker: str) -> Dict:
 def quote_snapshot(ticker: str) -> Dict:
     from market_clock import market_status
     status = market_status(ticker)
-    try:
-        intra = fetch(ticker, "5d", "5m", prepost=True)
-        if not intra.empty:
-            row = intra.iloc[-1]
-            return {"price": safe_float(row["Close"]), "asof": str(intra.index[-1]), "source": "5m", "market_status": status["status"]}
-    except Exception:
-        pass
+
+    # 5m data is useful during extended/regular trading, but querying it on a
+    # weekend/holiday wastes API calls and CPU. Fall back directly to the last
+    # completed daily close when the exchange is fully closed.
+    if status.get("is_pre") or status.get("is_open") or status.get("is_post"):
+        try:
+            intra = fetch(ticker, "5d", "5m", prepost=True)
+            if not intra.empty:
+                row = intra.iloc[-1]
+                return {"price": safe_float(row["Close"]), "asof": str(intra.index[-1]), "source": "5m", "market_status": status["status"]}
+        except Exception:
+            pass
     daily = fetch(ticker, "1mo", "1d")
     if daily.empty:
         raise DataError(f"Nessun prezzo per {ticker}")
     return {"price": safe_float(daily["Close"].iloc[-1]), "asof": str(daily.index[-1]), "source": "1d", "market_status": status["status"]}
 
 
-def data_health(ticker: str, force: bool = False) -> Dict:
+def data_health(ticker: str, force: bool = False, live: bool | None = None) -> Dict:
     ticker = ticker.strip().upper()
     now = time_module.time()
     cached = _HEALTH_CACHE.get(ticker)
     if not force and cached and now - cached[0] < 300:
         return dict(cached[1])
+
+    from market_clock import market_status
+    clock = market_status(ticker)
+    if live is None:
+        live = bool(clock.get("is_open") or clock.get("is_pre"))
+
     health = {
         "ticker": ticker,
         "daily_bars": 0,
@@ -475,6 +486,7 @@ def data_health(ticker: str, force: bool = False) -> Dict:
         "intraday_last": None,
         "status": "UNKNOWN",
         "warnings": [],
+        "live_checks": bool(live),
     }
     try:
         daily = fetch(ticker, "7y", "1d")
@@ -482,17 +494,25 @@ def data_health(ticker: str, force: bool = False) -> Dict:
         health["daily_last"] = str(daily.index[-1]) if len(daily) else None
     except Exception as exc:
         health["warnings"].append(f"Daily: {exc}")
-    try:
-        intra = latest_regular(ticker)
-        health["intraday_bars"] = len(intra)
-        health["intraday_last"] = str(intra.index[-1]) if len(intra) else None
-    except Exception as exc:
-        health["warnings"].append(f"Intraday: {exc}")
-    try:
-        pre = premarket_df(ticker)
-        health["premarket_bars"] = len(pre)
-    except Exception as exc:
-        health["warnings"].append(f"Premarket: {exc}")
+
+    # Avoid two extra 5m downloads whenever the market is fully closed. During
+    # live operation query only the relevant feed: premarket before the open,
+    # regular bars once the session is open.
+    if live and clock.get("is_open"):
+        try:
+            intra = latest_regular(ticker)
+            health["intraday_bars"] = len(intra)
+            health["intraday_last"] = str(intra.index[-1]) if len(intra) else None
+        except Exception as exc:
+            health["warnings"].append(f"Intraday: {exc}")
+    elif live and clock.get("is_pre"):
+        try:
+            pre = premarket_df(ticker)
+            health["premarket_bars"] = len(pre)
+            health["intraday_last"] = str(pre.index[-1]) if len(pre) else None
+        except Exception as exc:
+            health["warnings"].append(f"Premarket: {exc}")
+
     if health["daily_bars"] >= 180 and not health["warnings"]:
         health["status"] = "OK"
     elif health["daily_bars"] >= 80:

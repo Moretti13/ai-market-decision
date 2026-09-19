@@ -108,7 +108,14 @@ def render_analysis(r: dict):
         else:
             st.info(f"**{status}** — {confirm.get('message', 'Nessun ingresso.')}")
     else:
-        st.warning("Mercato chiuso: il DAY prepara la prossima sessione; nessun nuovo ingresso intraday adesso.")
+        reason = clock.get("closed_reason")
+        next_open = clock.get("next_open")
+        suffix = f" · prossima apertura {next_open.strftime('%Y-%m-%d %H:%M %Z')}" if next_open else ""
+        if clock.get("is_post"):
+            st.warning(f"After-hours: nessun nuovo ingresso DAY; il sistema prepara la prossima sessione{suffix}.")
+        else:
+            reason_txt = f" ({reason.lower()})" if reason else ""
+            st.warning(f"Mercato chiuso{reason_txt}: nessun nuovo ingresso intraday adesso{suffix}.")
 
     p = st.columns(6)
     p[0].metric("Azione", plan.get("action", "NON ENTRARE"))
@@ -216,16 +223,16 @@ def render_analysis(r: dict):
         if record_event_once(
             event_key, ticker, "DAY", confirm.get("signal", ""),
             plan.get("entry", 0.0), plan.get("stop", 0.0), plan.get("target", 0.0),
-            notes="V7.1 confirmed DAY signal",
+            notes="V7.2 confirmed DAY signal",
         ):
             send_telegram(
-                f"AI Market Decision V7.1\n{ticker} DAY\n{confirm.get('signal')}\n"
+                f"AI Market Decision V7.2\n{ticker} DAY\n{confirm.get('signal')}\n"
                 f"Entry {plan.get('entry', 0):.2f}\nStop {plan.get('stop', 0):.2f}\nTarget {plan.get('target', 0):.2f}\n"
                 f"P(up) {pre.get('p_up', .5)*100:.1f}%\nEvent risk {pre.get('event_risk')}"
             )
 
 
-st.title("📈 AI Market Decision V7.1 Performance")
+st.title(f"📈 {APP_NAME}")
 st.caption("DAY + WEEK + MONTH · modelli persistenti · live inference · news/eventi · macro/regime · scanner · walk-forward · paper positions")
 
 with st.sidebar:
@@ -236,7 +243,9 @@ with st.sidebar:
         "Rischio massimo per operazione (%)", min_value=0.1, max_value=5.0,
         value=float(DEFAULTS["risk_pct"] * 100), step=0.1,
     ) / 100
-    auto = st.toggle("Ricalcolo automatico", value=True)
+    if risk_pct > 0.02:
+        st.warning("Per il paper test stai usando un rischio >2% per operazione: è un'impostazione aggressiva.")
+    auto = st.toggle("Ricalcolo automatico", value=False, help="Consigliato OFF nei test. Se attivo, V7.2 aggiorna automaticamente solo in premarket/sessione regolare.")
     refresh_minutes = st.selectbox("Intervallo", [5, 10, 15], index=0, disabled=not auto)
     if st.button("🔄 Ricalcola ora", type="primary"):
         st.session_state["refresh_nonce"] = int(st.session_state.get("refresh_nonce", 0)) + 1
@@ -266,9 +275,14 @@ except Exception as exc:
     st.session_state["auto_verify_result"] = {"checked": 0, "evaluated": 0, "errors": [str(exc)]}
 
 
-@st.fragment(run_every=timedelta(minutes=refresh_minutes) if auto else None)
+live_auto = bool(auto and (result.get("clock", {}).get("is_pre") or result.get("clock", {}).get("is_open")))
+if auto and not live_auto:
+    st.sidebar.caption("Auto-refresh sospeso: fuori da premarket/sessione regolare. Ripartirà quando il mercato è nella finestra live.")
+
+
+@st.fragment(run_every=timedelta(minutes=refresh_minutes) if live_auto else None)
 def live_panel():
-    current = cached_analysis(ticker, capital, risk_pct, nonce) if auto else result
+    current = cached_analysis(ticker, capital, risk_pct, nonce) if live_auto else result
     st.session_state["analysis"] = current
     try:
         store_analysis_predictions(current)
@@ -348,11 +362,17 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Paper Position Tracker")
-    monitor = monitor_open_positions(auto_close_levels=True)
-    for ev in monitor.get("events", []):
-        key = f"V7|POSITION|{ev['id']}|{ev['reason']}"
-        if record_event_once(key, ev["ticker"], "POSITION", ev["reason"], ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}"):
-            send_telegram(f"AI Market Decision V7.1\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
+    st.caption("Per ridurre chiamate dati/CPU, il monitor paper non interroga i prezzi ad ogni rerun della pagina. Aggiornalo quando vuoi controllare stop/target.")
+    if st.button("🔄 Aggiorna posizioni paper / stop-target", key="refresh_paper_positions"):
+        monitor = monitor_open_positions(auto_close_levels=True)
+        st.session_state["paper_monitor"] = monitor
+        for ev in monitor.get("events", []):
+            key = f"V72|POSITION|{ev['id']}|{ev['reason']}"
+            if record_event_once(key, ev["ticker"], "POSITION", ev["reason"], ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}"):
+                send_telegram(f"AI Market Decision V7.2\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
+    monitor = st.session_state.get("paper_monitor", {"updated": 0, "closed": 0, "events": [], "errors": []})
+    if monitor.get("updated") or monitor.get("closed"):
+        st.info(f"Paper tracker: aggiornate {monitor.get('updated', 0)} · chiuse {monitor.get('closed', 0)}")
     if monitor.get("errors"):
         st.warning(monitor["errors"])
 
@@ -363,7 +383,7 @@ with tabs[3]:
         if st.button("➕ Registra piano come PAPER POSITION"):
             pid = open_position(
                 ticker, "DAY", plan["side"], int(plan["shares"]), float(plan["entry"]),
-                float(plan["stop"]), float(plan["target"]), notes="V7.1 current DAY plan",
+                float(plan["stop"]), float(plan["target"]), notes="V7.2 current DAY plan",
             )
             st.success(f"Paper position registrata (ID {pid}).")
     else:
@@ -378,7 +398,7 @@ with tabs[3]:
         ms = st.number_input("Stop", min_value=0.0, value=max(0.0, float(plan.get("stop", 0.0) or 0.0)), key="ms")
         mt = st.number_input("Target", min_value=0.0, value=max(0.0, float(plan.get("target", 0.0) or 0.0)), key="mt")
         if st.button("Salva posizione manuale"):
-            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7.1 manual paper position")
+            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7.2 manual paper position")
             st.success(f"Posizione {pid} salvata.")
 
     open_df = open_positions()
@@ -406,7 +426,7 @@ with tabs[4]:
         "data_source": "Yahoo Finance via yfinance",
         "database": "PostgreSQL se DATABASE_URL è configurato, altrimenti SQLite locale",
     })
-    st.info("V7.1 separa training e inference: i modelli vengono riutilizzati finché non arriva una nuova barra daily completata; prezzo/gap/5m/VWAP/news continuano ad aggiornare il segnale.")
+    st.info("V7.2 mantiene training e inference separati, evita fetch 5m quando il mercato è chiuso e limita l’auto-refresh alle finestre live. I modelli vengono riutilizzati finché non arriva una nuova barra daily completata.")
     if st.button("🧠 Forza retraining modelli del ticker"):
         removed = clear_model_cache(ticker)
         cached_analysis.clear()
@@ -414,13 +434,13 @@ with tabs[4]:
         st.success(f"Cache modelli di {ticker} azzerata ({removed} file). Al prossimo ricalcolo verranno riaddestrati.")
 
     if st.button("📨 Test Telegram"):
-        if send_telegram("AI Market Decision V7.1 — test alert OK"):
+        if send_telegram("AI Market Decision V7.2 — test alert OK"):
             st.success("Messaggio Telegram inviato.")
         else:
             st.warning("Telegram non configurato o invio fallito. Controlla TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nei Secrets.")
     st.markdown(
         """
-        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7.1 non invia ordini e non garantisce profitti.\n\n
+        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7.2 non invia ordini e non garantisce profitti.\n\n
         **Short:** ENTER SELL/SHORT richiede un conto che consenta la vendita allo scoperto; altrimenti interpreta SELL come uscita/avoid.\n\n
         **Persistenza:** su Streamlit Cloud usa PostgreSQL/Supabase tramite `DATABASE_URL`; il filesystem locale può essere ricreato nei redeploy.
         """
@@ -432,7 +452,7 @@ payload = json.dumps(st.session_state["analysis"], default=str, ensure_ascii=Fal
 st.download_button(
     "⬇️ Esporta analisi JSON",
     data=payload.encode("utf-8"),
-    file_name=f"{ticker}_analysis_v7_1.json",
+    file_name=f"{ticker}_analysis_v7_2.json",
     mime="application/json",
 )
 st.caption(f"AI Market Decision V{APP_VERSION} · {APP_BUILD} · refresh {refresh_minutes if auto else 'manuale'} min")
