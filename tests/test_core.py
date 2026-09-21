@@ -18,6 +18,7 @@ from market_clock import market_status, session_hours  # noqa: E402
 from model_engine import _backtest_frame, _train_predict  # noqa: E402
 from news_engine import score_title  # noqa: E402
 from signal_engine import _confirmation_logic, confirm_open  # noqa: E402
+from scanner import _opportunity_detail  # noqa: E402
 from portfolio import position_pnl  # noqa: E402
 
 
@@ -94,6 +95,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(position_pnl("LONG", 10, 100, 105), 50)
         self.assertEqual(position_pnl("SHORT", 10, 100, 95), 50)
 
+    def test_scanner_watch_score(self):
+        near = _opportunity_detail("WAIT", 0.62, 0.0045, 0.60, 0.0035, "NORMAL")
+        self.assertEqual(near["candidate_side"], "BUY")
+        self.assertGreaterEqual(near["score"], 60)
+        self.assertIn("WATCH", near["display_signal"])
+        conflict = _opportunity_detail("WAIT", 0.65, -0.001, 0.50, 0.0035, "NORMAL")
+        self.assertLess(conflict["score"], near["score"])
+
     def test_model_and_backtest_helpers(self):
         rng = np.random.default_rng(7)
         n = 430
@@ -122,6 +131,9 @@ class DatabaseTests(unittest.TestCase):
             db.reset_engine_cache()
             try:
                 db.init_db()
+                self.assertFalse(db.event_exists("scanner-test"))
+                self.assertTrue(db.record_event_once("scanner-test", "NVDA", "DAY", "BUY WATCH", 0, 0, 0, "test"))
+                self.assertTrue(db.event_exists("scanner-test"))
                 pid = db.open_position("NVDA", "DAY", "LONG", 2, 100.0, 95.0, 110.0, "test")
                 self.assertGreaterEqual(pid, 1)
                 opened = db.open_positions()

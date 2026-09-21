@@ -12,6 +12,7 @@ from data_layer import current_fundamentals
 from db import (
     all_positions,
     close_position,
+    event_exists,
     open_position,
     open_positions,
     prediction_history,
@@ -19,6 +20,7 @@ from db import (
     recent_events,
     record_event_once,
 )
+from market_clock import market_status
 from model_engine import clear_model_cache, walk_forward_backtest
 from portfolio import monitor_open_positions, position_pnl
 from scanner import scanner
@@ -41,6 +43,59 @@ def cached_verification(nonce: int = 0):
 @st.cache_data(ttl=21600, show_spinner=False)
 def cached_fundamentals(ticker: str):
     return current_fundamentals(ticker)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_scanner(max_assets: int, horizon: str, bucket: int):
+    # DAY-only radar scans are intentionally light. WEEK/MONTH are calculated only
+    # when that view is explicitly requested from the scanner UI.
+    return scanner(ALL_UNIVERSE, max_assets=max_assets, horizons=(horizon,))
+
+
+def notify_scanner_candidates(df: pd.DataFrame, horizon: str, threshold: float, include_watch: bool = True) -> dict:
+    result = {"eligible": 0, "sent": 0, "skipped": 0, "failed": 0}
+    if not isinstance(df, pd.DataFrame) or df.empty or not telegram_configured():
+        return result
+    horizon = str(horizon).upper()
+    signal_col = horizon
+    score_col = f"{horizon}_score"
+    reason_col = f"{horizon}_reason"
+    prob_col = f"{horizon}_prob"
+    exp_col = f"{horizon}_exp"
+    day_key = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+    for _, row in df.iterrows():
+        state = str(row.get(signal_col, "WAIT")).upper()
+        score = float(row.get(score_col, 0.0) or 0.0)
+        if state in {"WAIT", "HOLD", "N/A"} or score < float(threshold):
+            continue
+        if "WATCH" in state and not include_watch:
+            continue
+        result["eligible"] += 1
+        ticker_row = str(row.get("ticker", "")).upper()
+        event_key = f"V73|RADAR|{day_key}|{horizon}|{ticker_row}|{state}"
+        if event_exists(event_key):
+            result["skipped"] += 1
+            continue
+        message = (
+            f"📡 AI Market Decision V7.3 RADAR\n"
+            f"{ticker_row} · {horizon} · {state}\n"
+            f"Opportunity score: {score:.1f}/100\n"
+            f"P(up): {float(row.get(prob_col, 50.0)):.1f}%\n"
+            f"Rend. atteso: {float(row.get(exp_col, 0.0)):+.2f}%\n"
+            f"Event risk: {row.get('event_risk', 'NORMAL')}\n"
+            f"Regime: {row.get('regime', 'UNKNOWN')}\n"
+            f"Motivo: {row.get(reason_col, '—')}\n"
+            f"Apri il ticker nell'app e verifica la conferma 5m prima di operare."
+        )
+        if send_telegram(message):
+            record_event_once(
+                event_key, ticker_row, horizon, state, 0.0, 0.0, 0.0,
+                notes=f"Radar score {score:.1f}; {row.get(reason_col, '')}",
+            )
+            result["sent"] += 1
+        else:
+            result["failed"] += 1
+    return result
 
 
 def pct(v) -> str:
@@ -219,14 +274,14 @@ def render_analysis(r: dict):
         st.caption("Fonte attuale: Yahoo Finance/yfinance, adatta al test del prototipo ma non equivalente a un feed professionale con SLA.")
 
     if plan.get("status") == "READY" and confirm.get("status") == "CONFIRMED":
-        event_key = f"V7|{ticker}|DAY|{clock['now'].date()}|{confirm.get('signal')}"
+        event_key = f"V73|{ticker}|DAY|{clock['now'].date()}|{confirm.get('signal')}"
         if record_event_once(
             event_key, ticker, "DAY", confirm.get("signal", ""),
             plan.get("entry", 0.0), plan.get("stop", 0.0), plan.get("target", 0.0),
-            notes="V7.2 confirmed DAY signal",
+            notes="V7.3 confirmed DAY signal",
         ):
             send_telegram(
-                f"AI Market Decision V7.2\n{ticker} DAY\n{confirm.get('signal')}\n"
+                f"AI Market Decision V7.3\n{ticker} DAY\n{confirm.get('signal')}\n"
                 f"Entry {plan.get('entry', 0):.2f}\nStop {plan.get('stop', 0):.2f}\nTarget {plan.get('target', 0):.2f}\n"
                 f"P(up) {pre.get('p_up', .5)*100:.1f}%\nEvent risk {pre.get('event_risk')}"
             )
@@ -245,8 +300,8 @@ with st.sidebar:
     ) / 100
     if risk_pct > 0.02:
         st.warning("Per il paper test stai usando un rischio >2% per operazione: è un'impostazione aggressiva.")
-    auto = st.toggle("Ricalcolo automatico", value=False, help="Consigliato OFF nei test. Se attivo, V7.2 aggiorna automaticamente solo in premarket/sessione regolare.")
-    refresh_minutes = st.selectbox("Intervallo", [5, 10, 15], index=0, disabled=not auto)
+    auto = st.toggle("Ricalcolo automatico asset", value=False, help="Se attivo, V7.3 ricalcola il ticker selezionato solo in premarket/sessione regolare. 15 minuti è l’impostazione più leggera.")
+    refresh_minutes = st.selectbox("Intervallo asset", [5, 10, 15], index=2, disabled=not auto)
     if st.button("🔄 Ricalcola ora", type="primary"):
         st.session_state["refresh_nonce"] = int(st.session_state.get("refresh_nonce", 0)) + 1
         st.session_state.pop("analysis_key", None)
@@ -277,12 +332,14 @@ except Exception as exc:
 
 live_auto = bool(auto and (result.get("clock", {}).get("is_pre") or result.get("clock", {}).get("is_open")))
 if auto and not live_auto:
-    st.sidebar.caption("Auto-refresh sospeso: fuori da premarket/sessione regolare. Ripartirà quando il mercato è nella finestra live.")
+    st.sidebar.caption("Auto-refresh in attesa: fuori da premarket/sessione regolare farà solo un controllo leggero dell'orario e ripartirà automaticamente quando il mercato entra nella finestra live.")
 
 
-@st.fragment(run_every=timedelta(minutes=refresh_minutes) if live_auto else None)
+@st.fragment(run_every=timedelta(minutes=refresh_minutes) if auto else None)
 def live_panel():
-    current = cached_analysis(ticker, capital, risk_pct, nonce) if live_auto else result
+    status_now = market_status(ticker) if auto else result.get("clock", {})
+    should_refresh = bool(auto and (status_now.get("is_pre") or status_now.get("is_open")))
+    current = cached_analysis(ticker, capital, risk_pct, nonce) if should_refresh else result
     st.session_state["analysis"] = current
     try:
         store_analysis_predictions(current)
@@ -297,27 +354,76 @@ st.divider()
 tabs = st.tabs(["🔎 Scanner", "📊 Backtest", "✅ Verifica previsioni", "💼 Posizioni", "🛠️ Sistema"])
 
 with tabs[0]:
-    st.subheader("Market Scanner V7")
+    st.subheader("Market Scanner V7.3 — WATCH + Radar")
     c1, c2, c3 = st.columns(3)
     scan_n = c1.slider("Numero asset", 3, min(15, len(ALL_UNIVERSE)), int(DEFAULTS["scanner_assets"]))
     horizon_view = c2.selectbox("Vista", ["DAY", "WEEK", "MONTH"])
-    side_view = c3.selectbox("Segnali", ["TUTTI", "BUY", "SELL"])
+    side_view = c3.selectbox("Segnali", ["TUTTI", "BUY", "SELL", "WATCH"])
+
     if st.button("🚀 Scansiona mercato", type="primary"):
-        with st.spinner("Scansione controllata... il primo passaggio crea la cache dei modelli; i successivi sono più rapidi."):
-            st.session_state["scan_df_v7"] = scanner(ALL_UNIVERSE, scan_n)
+        st.session_state["scan_nonce_v73"] = int(st.session_state.get("scan_nonce_v73", 0)) + 1
+        nonce_scan = int(st.session_state["scan_nonce_v73"])
+        with st.spinner(f"Scansione {horizon_view} controllata..."):
+            st.session_state["scan_df_v7"] = cached_scanner(scan_n, horizon_view, nonce_scan)
+
+    st.markdown("#### 📡 Radar automatico + Telegram")
+    r1, r2, r3, r4 = st.columns(4)
+    radar_enabled = r1.toggle("Radar automatico", value=False, help="Scansiona DAY automaticamente mentre l'app Streamlit è sveglia.")
+    radar_interval = r2.selectbox("Ogni", [15, 30, 60], index=0, format_func=lambda x: f"{x} min", disabled=not radar_enabled)
+    radar_threshold = r3.slider("Score alert", 60, 95, int(DEFAULTS.get("scanner_alert_score", 75)), disabled=not radar_enabled)
+    radar_watch = r4.toggle("Notifica WATCH", value=True, disabled=not radar_enabled)
+
+    if radar_enabled and not telegram_configured():
+        st.warning("Radar attivo, ma Telegram non è configurato: la scansione funziona, le notifiche no. Configuralo nella scheda Sistema.")
+
+    clock_for_radar = market_status(ticker) if radar_enabled else result.get("clock", {})
+    radar_live = bool(clock_for_radar.get("is_pre") or clock_for_radar.get("is_open"))
+    if radar_enabled and not radar_live:
+        st.caption("Radar in attesa fuori dalla finestra live del ticker principale: ogni intervallo controlla solo l'orario e riparte automaticamente quando entra in premarket/sessione regolare.")
+
+    @st.fragment(run_every=timedelta(minutes=radar_interval) if radar_enabled else None)
+    def radar_worker():
+        if not radar_enabled:
+            return
+        status_now = market_status(ticker)
+        if not (status_now.get("is_pre") or status_now.get("is_open")):
+            st.caption(f"Radar standby · {status_now.get('status', 'CLOSED')} · nessuna scansione dati eseguita.")
+            return
+        seconds = max(900, int(radar_interval) * 60)
+        bucket = int(pd.Timestamp.now(tz="UTC").timestamp() // seconds)
+        with st.spinner(f"Radar DAY: scansione di {scan_n} asset..."):
+            radar_df = cached_scanner(scan_n, "DAY", bucket)
+        st.session_state["scan_df_v7"] = radar_df
+        alert_result = notify_scanner_candidates(radar_df, "DAY", radar_threshold, radar_watch)
+        st.caption(
+            f"Radar aggiornato {pd.Timestamp.now(tz='UTC').strftime('%H:%M UTC')} · "
+            f"candidati {alert_result['eligible']} · notifiche nuove {alert_result['sent']} · già notificate {alert_result['skipped']}"
+        )
+
+    radar_worker()
+
     df = st.session_state.get("scan_df_v7")
     if isinstance(df, pd.DataFrame) and not df.empty:
         sig, prob, exp, score = horizon_view, f"{horizon_view}_prob", f"{horizon_view}_exp", f"{horizon_view}_score"
+        reason = f"{horizon_view}_reason"
         view = df.copy()
-        if side_view == "BUY":
-            view = view[view[sig].astype(str).str.contains("BUY")]
-        elif side_view == "SELL":
-            view = view[view[sig].astype(str).str.contains("SELL")]
-        cols = ["ticker", sig, prob, exp, score, "event_risk", "catalyst", "regime", "news"]
-        st.dataframe(view[cols].sort_values(score, ascending=False), use_container_width=True, hide_index=True)
-        st.caption("Score = priorità del modello in base a probabilità, edge atteso e qualità. Non è una classifica di rendimento garantito.")
+        # A dataframe may come from the DAY-only automatic radar while the user is
+        # viewing WEEK/MONTH. In that case ask for a manual scan of that horizon.
+        if sig not in view.columns or view[sig].astype(str).eq("N/A").all():
+            st.info(f"Il Radar automatico calcola DAY per contenere CPU. Premi 'Scansiona mercato' per calcolare {horizon_view}.")
+        else:
+            if side_view == "BUY":
+                view = view[view[sig].astype(str).str.contains("BUY")]
+            elif side_view == "SELL":
+                view = view[view[sig].astype(str).str.contains("SELL")]
+            elif side_view == "WATCH":
+                view = view[view[sig].astype(str).str.contains("WATCH")]
+            cols = ["ticker", sig, prob, exp, score, reason, "event_risk", "catalyst", "regime", "news"]
+            cols = [c for c in cols if c in view.columns]
+            st.dataframe(view[cols].sort_values(score, ascending=False), use_container_width=True, hide_index=True)
+            st.caption("Opportunity Score = priorità del setup in base a probabilità, edge atteso, qualità ed event risk. WATCH significa 'vicino alle soglie', non ordine di ingresso né profitto garantito.")
     else:
-        st.info("Premi 'Scansiona mercato'.")
+        st.info("Premi 'Scansiona mercato' oppure abilita il Radar automatico.")
 
 with tabs[1]:
     st.subheader("Walk-forward Backtest")
@@ -367,9 +473,9 @@ with tabs[3]:
         monitor = monitor_open_positions(auto_close_levels=True)
         st.session_state["paper_monitor"] = monitor
         for ev in monitor.get("events", []):
-            key = f"V72|POSITION|{ev['id']}|{ev['reason']}"
+            key = f"V73|POSITION|{ev['id']}|{ev['reason']}"
             if record_event_once(key, ev["ticker"], "POSITION", ev["reason"], ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}"):
-                send_telegram(f"AI Market Decision V7.2\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
+                send_telegram(f"AI Market Decision V7.3\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
     monitor = st.session_state.get("paper_monitor", {"updated": 0, "closed": 0, "events": [], "errors": []})
     if monitor.get("updated") or monitor.get("closed"):
         st.info(f"Paper tracker: aggiornate {monitor.get('updated', 0)} · chiuse {monitor.get('closed', 0)}")
@@ -383,7 +489,7 @@ with tabs[3]:
         if st.button("➕ Registra piano come PAPER POSITION"):
             pid = open_position(
                 ticker, "DAY", plan["side"], int(plan["shares"]), float(plan["entry"]),
-                float(plan["stop"]), float(plan["target"]), notes="V7.2 current DAY plan",
+                float(plan["stop"]), float(plan["target"]), notes="V7.3 current DAY plan",
             )
             st.success(f"Paper position registrata (ID {pid}).")
     else:
@@ -398,7 +504,7 @@ with tabs[3]:
         ms = st.number_input("Stop", min_value=0.0, value=max(0.0, float(plan.get("stop", 0.0) or 0.0)), key="ms")
         mt = st.number_input("Target", min_value=0.0, value=max(0.0, float(plan.get("target", 0.0) or 0.0)), key="mt")
         if st.button("Salva posizione manuale"):
-            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7.2 manual paper position")
+            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7.3 manual paper position")
             st.success(f"Posizione {pid} salvata.")
 
     open_df = open_positions()
@@ -426,7 +532,7 @@ with tabs[4]:
         "data_source": "Yahoo Finance via yfinance",
         "database": "PostgreSQL se DATABASE_URL è configurato, altrimenti SQLite locale",
     })
-    st.info("V7.2 mantiene training e inference separati, evita fetch 5m quando il mercato è chiuso e limita l’auto-refresh alle finestre live. I modelli vengono riutilizzati finché non arriva una nuova barra daily completata.")
+    st.info("V7.3 aggiunge Opportunity Score/WATCH, Radar DAY automatico e alert Telegram deduplicati. Training e inference restano separati e il Radar DAY calcola un solo orizzonte per contenere CPU.")
     if st.button("🧠 Forza retraining modelli del ticker"):
         removed = clear_model_cache(ticker)
         cached_analysis.clear()
@@ -434,13 +540,29 @@ with tabs[4]:
         st.success(f"Cache modelli di {ticker} azzerata ({removed} file). Al prossimo ricalcolo verranno riaddestrati.")
 
     if st.button("📨 Test Telegram"):
-        if send_telegram("AI Market Decision V7.2 — test alert OK"):
+        if send_telegram("AI Market Decision V7.3 — test alert OK"):
             st.success("Messaggio Telegram inviato.")
         else:
             st.warning("Telegram non configurato o invio fallito. Controlla TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nei Secrets.")
+    with st.expander("📲 Come configurare Telegram"): 
+        st.markdown(
+            """
+            1. In Telegram apri **@BotFather**, crea un bot con `/newbot` e conserva il token.  
+            2. Apri una chat con il bot e inviagli almeno un messaggio.  
+            3. Recupera il tuo `chat_id` (puoi usare l'API `getUpdates` del bot oppure un bot dedicato che mostra il chat id).  
+            4. In Streamlit Cloud vai in **Manage app → Settings → Secrets** e aggiungi:
+
+            ```toml
+            TELEGRAM_BOT_TOKEN = "il_tuo_token"
+            TELEGRAM_CHAT_ID = "il_tuo_chat_id"
+            ```
+
+            Non mettere token o chat id nel repository GitHub. Dopo aver salvato i Secrets, premi **Test Telegram**.
+            """
+        )
     st.markdown(
         """
-        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7.2 non invia ordini e non garantisce profitti.\n\n
+        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7.3 non invia ordini e non garantisce profitti.\n\n
         **Short:** ENTER SELL/SHORT richiede un conto che consenta la vendita allo scoperto; altrimenti interpreta SELL come uscita/avoid.\n\n
         **Persistenza:** su Streamlit Cloud usa PostgreSQL/Supabase tramite `DATABASE_URL`; il filesystem locale può essere ricreato nei redeploy.
         """

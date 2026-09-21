@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-APP_NAME = "AI Market Decision V7.2 Stability"
-APP_VERSION = "7.2.0"
-APP_BUILD = "V7.2-STABILITY"
+APP_NAME = "AI Market Decision V7.3 Radar"
+APP_VERSION = "7.3.0"
+APP_BUILD = "V7.3-RADAR"
 
 US_STOCKS = [
     "NVDA", "AMD", "AVGO", "MSFT", "AMZN", "META", "GOOGL", "AAPL", "TSLA", "NFLX",
@@ -38,6 +38,10 @@ DEFAULTS = {
     "refresh_seconds": 300,
     "scanner_assets": 5,
     "scanner_workers": 1,
+    "scanner_watch_score": 60.0,
+    "scanner_alert_score": 75.0,
+    "radar_interval_minutes": 15,
+    "radar_assets": 5,
     "buy_prob": 0.64,
     "sell_prob": 0.36,
     "day_min_edge": 0.0035,

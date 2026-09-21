@@ -1,25 +1,22 @@
-# Deploy Checklist V7.1 Performance
+# Deploy Checklist V7.3 Radar
 
 ## GitHub
 
-Carica i file V7.1 nella **root** del repository, sostituendo quelli V7 con lo stesso nome. `app.py` deve restare direttamente nella root.
+Carica la patch V7.3 nella **root** del repository e sostituisci i file con lo stesso nome.
 
-File principali da aggiornare:
+File principali aggiornati:
 
 - `app.py`
-- `config.py`
-- `data_layer.py`
-- `model_engine.py`
-- `signal_engine.py`
 - `scanner.py`
-- `news_engine.py`
-- `events_engine.py`
-- `macro_engine.py`
-- `regime_engine.py`
-- `requirements.txt`
-- `README.md`
+- `config.py`
+- `db.py`
+- `tests/test_core.py`
 
-Gli altri file V7 possono restare invariati.
+File nuovi:
+
+- `PATCH_NOTES_V7_3.md`
+- `TELEGRAM_SETUP.md`
+- `MIGRATION_FROM_V7_2.md`
 
 ## Streamlit
 
@@ -27,23 +24,29 @@ Gli altri file V7 possono restare invariati.
 - Main file: `app.py`
 - Python: **3.12**
 
-Dopo il commit Streamlit dovrebbe ridistribuire automaticamente. Se non lo fa, usa Reboot app.
+Dopo il commit attendi il redeploy automatico. Se necessario usa **Manage app → Reboot app**.
 
-## Primo test
+## Test base
 
-1. Disattiva temporaneamente il refresh automatico se Streamlit è ancora sotto throttle.
-2. Apri NVDA e attendi il primo training.
-3. Premi `Ricalcola ora`: non deve riaddestrare i modelli se l'ultima barra daily completata non è cambiata.
-4. In `Data health / modello` controlla `DAY cache`, `WEEK cache`, `MONTH cache`: dopo il primo training dovresti vedere `MEMORY` o `DISK` nei ricalcoli successivi.
-5. Prova AAPL e SPY.
-6. Riattiva refresh automatico a 5 minuti.
-7. Scanner: iniziare con 3–5 asset.
-8. Backtest: eseguirlo manualmente, non durante lo scanner.
+1. Controlla che il titolo mostri **AI Market Decision V7.3 Radar**.
+2. Prova NVDA con `Ricalcola ora`.
+3. Apri Scanner e fai una scansione DAY di 5 asset.
+4. Verifica che alcuni WAIT possano diventare `BUY WATCH` / `SELL WATCH` e che la colonna `reason` spieghi il perché.
+5. Lascia lo `Score alert` a **75** per il primo paper test.
+6. Configura Telegram in **Sistema** e usa `Test Telegram`.
+7. Abilita `Radar automatico`, 5 asset, ogni **15 min**.
+8. Il radar deve rimanere in standby fuori da premarket/sessione regolare e ripartire automaticamente nella finestra live.
+9. Gli alert ripetuti dello stesso ticker/stato nello stesso giorno devono essere deduplicati.
 
-## Come verificare che il cambiamento di mercato venga ancora considerato
+## Impostazione consigliata
 
-Durante la sessione il prezzo/VWAP/momentum/volume devono continuare ad aggiornarsi. Il campo `trained_at` può restare uguale: è corretto. Il segnale DAY può cambiare anche senza nuovo training perché cambia l'inference live.
+- Ricalcolo asset: 15 min se attivo
+- Radar DAY: 15 min
+- Numero asset iniziale: 5
+- Score alert: 75/100
+- Notifica WATCH: ON durante il paper test
+- Backtest: manuale
 
-## Nota cache
+## Nota 24/7
 
-La cache su disco è locale al container Streamlit. Dopo un redeploy/sleep profondo la piattaforma può ricreare il filesystem e il primo caricamento può riaddestrare i modelli. Non è un errore.
+Il Radar V7.3 gira finché Streamlit è sveglio. Per un vero monitor 24/7 indipendente dall'app servirà un worker cloud separato in una fase successiva.

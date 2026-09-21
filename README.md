@@ -1,66 +1,51 @@
-# AI Market Decision V7.1 Performance
+# AI Market Decision V7.3 Radar
 
-V7.1 è l'aggiornamento prestazionale della V7 per ridurre CPU e tempi di attesa su Streamlit Community Cloud senza congelare il mercato.
+V7.3 estende V7.2 Stability con uno scanner più utile e un radar automatico opzionale.
 
-## Cosa cambia davvero
+## Cosa aggiunge
 
-- **Training separato dall'inference**: DAY/WEEK/MONTH non vengono riaddestrati a ogni refresh.
-- **Retraining intelligente**: un modello viene riaddestrato quando cambia l'ultima barra daily completata usata dal modello.
-- **Dati live sempre aggiornabili**: gap, prezzo, barre 5m, VWAP, momentum e volume continuano a cambiare il segnale DAY durante la sessione.
-- **Cache modelli in memoria + disco locale**: i modelli già addestrati vengono riutilizzati nello stesso ambiente Streamlit. Se il container viene ricreato, il primo caricamento può richiedere un nuovo training.
-- **News/eventi cache 5 min**, **regime cache 10 min**, **macro cache 15 min**, **FRED cache 6h**, **fondamentali on-demand 6h**.
-- **Niente doppio download intraday** nella stessa analisi.
-- **ATR riutilizzato** dal contesto già calcolato, evitando un secondo calcolo dello storico.
-- **Scanner più prudente sulle risorse**: default 5 asset, 1 worker; il primo scan scalda la cache, i successivi sono più rapidi.
-- **Backtest resta manuale** e non parte durante il normale refresh.
-- **WAIT più pulito**: Entry/Stop/Target vengono mostrati come non disponibili invece di ripetere il prezzo corrente.
-- **Refresh automatico minimo 5 minuti** per evitare carico inutile.
+- Opportunity Score 0–100 anche per setup ancora in WAIT/HOLD.
+- Stati `BUY WATCH` e `SELL WATCH` per i setup vicini alle soglie.
+- Colonna `reason` con spiegazione del mancato ingresso o dei requisiti già soddisfatti.
+- Scanner calcolato solo sull'orizzonte selezionato per ridurre CPU.
+- Radar DAY automatico ogni 15/30/60 minuti.
+- Alert Telegram automatici sopra una soglia score configurabile.
+- Deduplicazione alert: stesso ticker/stato/orizzonte una sola volta al giorno.
+- Ricalcolo automatico del ticker principale separato dal radar.
 
-## Perché il mercato continua a essere considerato
+## Configurazione consigliata per il test
 
-Il modello storico non viene congelato per sempre. Viene riaddestrato quando arriva nuova informazione daily completata. Durante la giornata, invece, la decisione DAY viene ricalcolata con input live: gap, prezzo, VWAP, momentum, volume, stato della sessione, regime ed eventi/news in cache breve.
+- Python 3.12
+- Ricalcolo asset: OFF oppure 15 minuti
+- Radar: 5 asset, DAY, ogni 15 minuti
+- Score alert: 75/100
+- Notifica WATCH: ON durante il paper test
+- Backtest: solo manuale
+- Paper trading prima di capitale reale
 
-In pratica: **training raro, inference frequente**.
+## Telegram
 
-## Fonte dati
+Configurare in Streamlit Secrets:
 
-La build usa Yahoo Finance tramite `yfinance`. È adatta al collaudo e al paper trading, ma non equivale a un feed professionale con SLA e streaming garantito.
+```toml
+TELEGRAM_BOT_TOKEN = "..."
+TELEGRAM_CHAT_ID = "..."
+```
 
-## Installazione / Streamlit
+Vedi `TELEGRAM_SETUP.md`.
 
-Consigliato Python **3.12**.
+## Limitazione importante
+
+Il radar automatico gira nei fragment Streamlit mentre l'app è sveglia. Community Cloud può sospendere l'app; un monitor 24/7 richiederà un worker cloud separato in una fase successiva.
+
+## Test del pacchetto
 
 ```bash
-pip install -r requirements.txt
 python healthcheck.py
 python -m unittest discover -s tests -v
 streamlit run app.py
 ```
 
-Su Streamlit Cloud:
+Build verificata offline con compilazione completa e 11 test automatici. I test live di Yahoo Finance/Telegram vanno eseguiti sul deploy Streamlit perché richiedono rete e credenziali.
 
-- repository: il tuo repository GitHub;
-- branch: `main`;
-- main file: `app.py`;
-- Python: `3.12`.
-
-## Test consigliato
-
-1. NVDA: attendi il primo caricamento.
-2. Premi `Ricalcola ora`: il secondo passaggio deve essere sensibilmente più rapido.
-3. AAPL e SPY: il primo caricamento crea le rispettive cache.
-4. Lascia il refresh automatico a 5 minuti.
-5. Scanner: inizialmente 3–5 asset.
-6. Backtest: avvialo solo manualmente.
-7. Paper trading prima di qualsiasi uso con capitale reale.
-
-## Verifiche del pacchetto
-
-- compilazione Python completa;
-- import di tutti i moduli core;
-- 8/8 test offline superati;
-- modello persistente con cache memory/disk;
-- nessun retraining dovuto al semplice refresh intraday;
-- Python target 3.12.
-
-V7.1 è la build consigliata per il test dell'architettura attuale. Non garantisce rendimenti e non invia ordini al broker.
+V7.3 è un sistema di supporto decisionale/paper trading: non invia ordini al broker e non garantisce profitti.

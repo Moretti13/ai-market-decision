@@ -144,6 +144,13 @@ def record_event_once(event_key: str, ticker: str, horizon: str, signal: str, en
         return False
 
 
+def event_exists(event_key: str) -> bool:
+    init_db()
+    query = select(signal_events.c.id).where(signal_events.c.event_key == str(event_key)).limit(1)
+    with engine().connect() as conn:
+        return conn.execute(query).first() is not None
+
+
 def recent_events(limit: int = 50) -> pd.DataFrame:
     init_db()
     query = select(signal_events).order_by(signal_events.c.id.desc()).limit(int(limit))
