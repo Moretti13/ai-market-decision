@@ -289,8 +289,57 @@ def premarket_df(ticker: str) -> pd.DataFrame:
     return df.loc[(minutes >= 240) & (minutes < 570)].copy()
 
 
+def _repair_intraday_volume(primary: pd.DataFrame, fallback: pd.DataFrame) -> pd.DataFrame:
+    """Repair obviously-missing Yahoo 5m volume without changing valid primary prices.
+
+    Yahoo occasionally returns a recent 5m row with Volume=0/missing while an
+    equivalent pre/post-enabled request contains the volume.  We only patch the
+    Volume field at matching timestamps and never fabricate volume.
+    """
+    if primary is None or primary.empty:
+        return fallback.copy() if fallback is not None else pd.DataFrame()
+    out = primary.copy()
+    if fallback is None or fallback.empty or "Volume" not in out.columns or "Volume" not in fallback.columns:
+        return out
+    alt = fallback.reindex(out.index)
+    base_vol = clean_numeric(out["Volume"])
+    alt_vol = clean_numeric(alt["Volume"])
+    replace_mask = (base_vol.isna() | (base_vol <= 0)) & (alt_vol > 0)
+    if replace_mask.any():
+        out.loc[replace_mask, "Volume"] = alt_vol.loc[replace_mask]
+    return out
+
+
 def latest_regular(ticker: str) -> pd.DataFrame:
-    return regular_session_df(fetch(ticker, "10d", "5m", prepost=False), ticker)
+    primary = regular_session_df(fetch(ticker, "10d", "5m", prepost=False), ticker)
+    if primary.empty or "Volume" not in primary.columns:
+        return primary
+
+    # Trigger a second Yahoo request only when *completed* recent bars have
+    # missing volume. A zero-volume currently-forming candle is simply ignored
+    # by intraday_state and should not cause another provider call.
+    recent_frame = primary
+    try:
+        from market_clock import market_status
+        status = market_status(ticker)
+        now_utc = pd.Timestamp(status["now"])
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.tz_localize(status["timezone"])
+        now_utc = now_utc.tz_convert("UTC")
+        completed = (primary.index + pd.Timedelta(minutes=5)) <= (now_utc - pd.Timedelta(seconds=2))
+        if completed.any():
+            recent_frame = primary.loc[completed]
+    except Exception:
+        pass
+    recent = clean_numeric(recent_frame["Volume"]).tail(4)
+    needs_volume_fallback = bool(len(recent) and (recent.isna().any() or (recent <= 0).any()))
+    if not needs_volume_fallback:
+        return primary
+    try:
+        alt = regular_session_df(fetch(ticker, "10d", "5m", prepost=True), ticker)
+        return _repair_intraday_volume(primary, alt)
+    except Exception:
+        return primary
 
 
 def intraday_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
@@ -302,16 +351,26 @@ def intraday_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         return x
     tz, _ = session_hours(ticker)
     close = clean_numeric(x["Close"])
-    volume = clean_numeric(x.get("Volume", pd.Series(index=x.index, dtype=float))).fillna(0)
+    volume = clean_numeric(x.get("Volume", pd.Series(index=x.index, dtype=float)))
+    # Zero volume on a liquid 5m bar is frequently a provider/incomplete-bar
+    # issue. Keep it as unavailable instead of turning it into a misleading
+    # 0.00 ratio. No synthetic volume is invented.
+    positive_volume = volume.where(volume > 0)
+    x["volume_valid"] = (positive_volume.notna()).astype(int)
     for bars, name in [(1, "ret5m"), (3, "ret15m"), (6, "ret30m"), (12, "ret60m")]:
         x[name] = close.pct_change(bars)
     local_dates = x.index.tz_convert(tz).date
-    pv = (close * volume).groupby(local_dates).cumsum()
-    vv = volume.groupby(local_dates).cumsum().replace(0, np.nan)
+    vwap_volume = positive_volume.fillna(0)
+    pv = (close * vwap_volume).groupby(local_dates).cumsum()
+    vv = vwap_volume.groupby(local_dates).cumsum().replace(0, np.nan)
     x["vwap"] = (pv / vv).fillna(close)
     x["vwap_dist"] = (close / x["vwap"] - 1).replace([np.inf, -np.inf], np.nan).fillna(0)
-    vm = volume.rolling(20, min_periods=5).mean().replace(0, np.nan)
-    x["volume_ratio"] = (volume / vm).replace([np.inf, -np.inf], np.nan).fillna(1)
+
+    # Compare the current completed bar only with prior positive-volume bars.
+    # shift(1) avoids diluting the ratio by including the current bar in its
+    # own baseline.  Median is more robust to opening-volume spikes.
+    baseline = positive_volume.shift(1).rolling(20, min_periods=5).median().replace(0, np.nan)
+    x["volume_ratio"] = (positive_volume / baseline).replace([np.inf, -np.inf], np.nan)
     x["session_date"] = local_dates
     x["bar_num"] = x.groupby("session_date").cumcount() + 1
     x["session_open"] = x.groupby("session_date")["Open"].transform("first")
@@ -322,7 +381,14 @@ def intraday_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     x["or_low"] = x.groupby("session_date")["Low"].transform(lambda s: s.iloc[:6].min())
     denom = (x["or_high"] - x["or_low"]).replace(0, np.nan)
     x["or_pos"] = ((close - x["or_low"]) / denom).replace([np.inf, -np.inf], np.nan).fillna(0.5)
-    return x.replace([np.inf, -np.inf], np.nan).fillna(0)
+    x = x.replace([np.inf, -np.inf], np.nan)
+    # Keep volume_ratio as NaN when Yahoo did not provide trustworthy volume;
+    # the confirmation engine will then ignore volume instead of treating 0 as
+    # a bearish/low-volume observation.
+    preserve_nan = x["volume_ratio"].copy()
+    x = x.fillna(0)
+    x["volume_ratio"] = preserve_nan
+    return x
 
 
 _NEWS_RAW_CACHE: Dict[Tuple[str, int], Tuple[float, List[Dict]]] = {}
@@ -479,11 +545,14 @@ def data_health(ticker: str, force: bool = False, live: bool | None = None) -> D
 
     health = {
         "ticker": ticker,
+        "provider": "Yahoo Finance / yfinance",
         "daily_bars": 0,
         "intraday_bars": 0,
         "premarket_bars": 0,
         "daily_last": None,
         "intraday_last": None,
+        "volume_status": "NOT_CHECKED",
+        "recent_volume_valid_pct": None,
         "status": "UNKNOWN",
         "warnings": [],
         "live_checks": bool(live),
@@ -503,6 +572,19 @@ def data_health(ticker: str, force: bool = False, live: bool | None = None) -> D
             intra = latest_regular(ticker)
             health["intraday_bars"] = len(intra)
             health["intraday_last"] = str(intra.index[-1]) if len(intra) else None
+            if len(intra) and "Volume" in intra.columns:
+                recent_vol = clean_numeric(intra["Volume"]).tail(12)
+                valid = recent_vol > 0
+                pct_valid = float(valid.mean()) if len(valid) else 0.0
+                health["recent_volume_valid_pct"] = pct_valid
+                if pct_valid >= 0.90:
+                    health["volume_status"] = "OK"
+                elif pct_valid >= 0.60:
+                    health["volume_status"] = "PARTIAL"
+                    health["warnings"].append("Volume 5m parzialmente disponibile da Yahoo")
+                else:
+                    health["volume_status"] = "UNAVAILABLE"
+                    health["warnings"].append("Volume 5m non affidabile da Yahoo; filtro volume ignorato")
         except Exception as exc:
             health["warnings"].append(f"Intraday: {exc}")
     elif live and clock.get("is_pre"):

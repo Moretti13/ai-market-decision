@@ -1,0 +1,10 @@
+V7.3.2 Yahoo Data Hotfix
+
+1. Estrai questo ZIP.
+2. Carica il CONTENUTO nella root del repository GitHub ai-market-decision.
+3. Sostituisci i file esistenti.
+4. Commit suggerito: Fix V7.3.2 Yahoo intraday data
+5. Lascia Python 3.12.
+6. Attendi il redeploy Streamlit.
+7. Verifica che in basso compaia V7.3.2-YAHOO-DATA-HOTFIX.
+8. Durante REGULAR SESSION controlla Vol ratio: deve essere un valore >0 oppure N/D, non un falso 0.00 dovuto a volume mancante.

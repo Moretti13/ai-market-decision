@@ -192,8 +192,11 @@ def render_analysis(r: dict):
     q[2].metric("Prezzo", num(confirm.get("current", pre.get("indicative"))))
     q[3].metric("VWAP", num(confirm.get("vwap", pre.get("indicative"))))
     q[4].metric("15m", pct(confirm.get("ret15m", 0.0)))
-    q[5].metric("Vol ratio", num(confirm.get("volume_ratio", 1.0)))
+    vol_ratio = confirm.get("volume_ratio")
+    q[5].metric("Vol ratio", num(vol_ratio) if confirm.get("volume_available", vol_ratio is not None) else "N/D")
     q[6].metric("Barre 5m", str(confirm.get("bars", 0)))
+    if not confirm.get("volume_available", vol_ratio is not None) and clock.get("is_open"):
+        st.caption("⚠️ Volume 5m Yahoo momentaneamente non affidabile: il filtro volume viene ignorato, non interpretato come 0.")
 
     st.markdown("### 📆 WEEK / MONTH")
     w, m = st.columns(2)
@@ -256,9 +259,11 @@ def render_analysis(r: dict):
     with st.expander("🩺 Data health / modello"):
         h = r.get("health", {})
         st.write({
-            "status": h.get("status"), "daily_bars": h.get("daily_bars"), "intraday_bars": h.get("intraday_bars"),
+            "status": h.get("status"), "provider": h.get("provider"),
+            "daily_bars": h.get("daily_bars"), "intraday_bars": h.get("intraday_bars"),
             "premarket_bars": h.get("premarket_bars"), "daily_last": h.get("daily_last"),
-            "intraday_last": h.get("intraday_last"), "warnings": h.get("warnings"),
+            "intraday_last": h.get("intraday_last"), "volume_status": h.get("volume_status"),
+            "recent_volume_valid_pct": h.get("recent_volume_valid_pct"), "warnings": h.get("warnings"),
         })
         st.write({
             "DAY accuracy": pre.get("model_accuracy"), "DAY AUC": pre.get("model_auc"),
@@ -274,14 +279,14 @@ def render_analysis(r: dict):
         st.caption("Fonte attuale: Yahoo Finance/yfinance, adatta al test del prototipo ma non equivalente a un feed professionale con SLA.")
 
     if plan.get("status") == "READY" and confirm.get("status") == "CONFIRMED":
-        event_key = f"V73|{ticker}|DAY|{clock['now'].date()}|{confirm.get('signal')}"
+        event_key = f"V732|{ticker}|DAY|{clock['now'].date()}|{confirm.get('signal')}"
         if record_event_once(
             event_key, ticker, "DAY", confirm.get("signal", ""),
             plan.get("entry", 0.0), plan.get("stop", 0.0), plan.get("target", 0.0),
-            notes="V7.3 confirmed DAY signal",
+            notes="V7.3.2 confirmed DAY signal",
         ):
             send_telegram(
-                f"AI Market Decision V7.3\n{ticker} DAY\n{confirm.get('signal')}\n"
+                f"AI Market Decision V7.3.2\n{ticker} DAY\n{confirm.get('signal')}\n"
                 f"Entry {plan.get('entry', 0):.2f}\nStop {plan.get('stop', 0):.2f}\nTarget {plan.get('target', 0):.2f}\n"
                 f"P(up) {pre.get('p_up', .5)*100:.1f}%\nEvent risk {pre.get('event_risk')}"
             )
@@ -300,7 +305,7 @@ with st.sidebar:
     ) / 100
     if risk_pct > 0.02:
         st.warning("Per il paper test stai usando un rischio >2% per operazione: è un'impostazione aggressiva.")
-    auto = st.toggle("Ricalcolo automatico asset", value=False, help="Se attivo, V7.3 ricalcola il ticker selezionato solo in premarket/sessione regolare. 15 minuti è l’impostazione più leggera.")
+    auto = st.toggle("Ricalcolo automatico asset", value=False, help="Se attivo, V7.3.2 ricalcola il ticker selezionato solo in premarket/sessione regolare. 15 minuti è l’impostazione più leggera.")
     refresh_minutes = st.selectbox("Intervallo asset", [5, 10, 15], index=2, disabled=not auto)
     if st.button("🔄 Ricalcola ora", type="primary"):
         st.session_state["refresh_nonce"] = int(st.session_state.get("refresh_nonce", 0)) + 1

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from config import MODEL_FEATURES  # noqa: E402
-from data_layer import daily_features, safe_float  # noqa: E402
+from data_layer import daily_features, intraday_features, _repair_intraday_volume, safe_float  # noqa: E402
 from market_clock import market_status, session_hours  # noqa: E402
 from model_engine import _backtest_frame, _train_predict  # noqa: E402
 from news_engine import score_title  # noqa: E402
@@ -45,6 +45,36 @@ class CoreTests(unittest.TestCase):
     def test_safe_float(self):
         self.assertEqual(safe_float("3.5"), 3.5)
         self.assertEqual(safe_float(float("nan"), 7), 7)
+
+    def test_intraday_zero_volume_is_unavailable_not_zero_ratio(self):
+        idx = pd.date_range("2026-09-21 13:30", periods=30, freq="5min", tz="UTC")
+        close = pd.Series(np.linspace(100, 103, len(idx)), index=idx)
+        df = pd.DataFrame({
+            "Open": close.shift(1).fillna(close.iloc[0]),
+            "High": close + 0.2,
+            "Low": close - 0.2,
+            "Close": close,
+            "Volume": pd.Series([1000] * 29 + [0], index=idx),
+        })
+        out = intraday_features(df, "NVDA")
+        self.assertEqual(int(out["volume_valid"].iloc[-1]), 0)
+        self.assertTrue(pd.isna(out["volume_ratio"].iloc[-1]))
+        self.assertGreater(float(out["volume_ratio"].iloc[-2]), 0)
+
+    def test_intraday_volume_repair_only_replaces_missing_volume(self):
+        idx = pd.date_range("2026-09-21 13:30", periods=3, freq="5min", tz="UTC")
+        primary = pd.DataFrame({
+            "Open": [100, 101, 102], "High": [101, 102, 103], "Low": [99, 100, 101],
+            "Close": [100.5, 101.5, 102.5], "Volume": [1000, 0, 1200],
+        }, index=idx)
+        fallback = primary.copy()
+        fallback["Close"] = [999, 999, 999]
+        fallback["Volume"] = [900, 1100, 1000]
+        out = _repair_intraday_volume(primary, fallback)
+        self.assertEqual(float(out["Volume"].iloc[1]), 1100)
+        self.assertEqual(float(out["Volume"].iloc[0]), 1000)
+        self.assertEqual(float(out["Close"].iloc[1]), 101.5)
+
 
     def test_market_hours(self):
         tz, (op, cl) = session_hours("NVDA")

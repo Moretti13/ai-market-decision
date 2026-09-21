@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-APP_NAME = "AI Market Decision V7.3.1 Radar"
-APP_VERSION = "7.3.1"
-APP_BUILD = "V7.3.1-DB-HOTFIX"
+APP_NAME = "AI Market Decision V7.3.2 Radar"
+APP_VERSION = "7.3.2"
+APP_BUILD = "V7.3.2-YAHOO-DATA-HOTFIX"
 
 US_STOCKS = [
     "NVDA", "AMD", "AVGO", "MSFT", "AMZN", "META", "GOOGL", "AAPL", "TSLA", "NFLX",

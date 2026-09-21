@@ -187,14 +187,37 @@ def intraday_state(ticker: str) -> Dict:
         today = x.loc[np.array(dates) == status["now"].date()]
         if today.empty:
             return {"status": "WAIT_FOR_OPEN", "bars": 0, **status}
-        row = today.iloc[-1]
+
+        # Yahoo often includes the currently-forming 5m candle. Use only bars
+        # whose nominal 5-minute interval has completed, avoiding transient
+        # zero volume and unstable momentum at the edge of a candle.
+        now_utc = pd.Timestamp(status["now"])
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.tz_localize(status["timezone"])
+        now_utc = now_utc.tz_convert("UTC")
+        completed_mask = (today.index + pd.Timedelta(minutes=5)) <= (now_utc - pd.Timedelta(seconds=2))
+        completed = today.loc[completed_mask]
+        if not completed.empty:
+            today_for_signal = completed
+        else:
+            today_for_signal = today.iloc[[-1]]
+
+        row = today_for_signal.iloc[-1]
+        raw_volume_ratio = row.get("volume_ratio", np.nan)
+        volume_available = bool(
+            int(safe_float(row.get("volume_valid", 0), 0)) > 0
+            and pd.notna(raw_volume_ratio)
+            and np.isfinite(float(raw_volume_ratio))
+            and float(raw_volume_ratio) > 0
+        )
+        volume_ratio = float(raw_volume_ratio) if volume_available else None
         return {
             "status": "LIVE" if status["is_open"] else status["status"],
-            "bars": int(len(today)),
-            "open": safe_float(today["Open"].iloc[0]),
+            "bars": int(len(today_for_signal)),
+            "open": safe_float(today_for_signal["Open"].iloc[0]),
             "current": safe_float(row["Close"]),
-            "high": safe_float(today["High"].max()),
-            "low": safe_float(today["Low"].min()),
+            "high": safe_float(today_for_signal["High"].max()),
+            "low": safe_float(today_for_signal["Low"].min()),
             "ret5m": safe_float(row["ret5m"]),
             "ret15m": safe_float(row["ret15m"]),
             "ret30m": safe_float(row["ret30m"]),
@@ -202,11 +225,13 @@ def intraday_state(ticker: str) -> Dict:
             "session_ret": safe_float(row["session_ret"]),
             "vwap": safe_float(row["vwap"]),
             "vwap_dist": safe_float(row["vwap_dist"]),
-            "volume_ratio": safe_float(row["volume_ratio"], 1.0),
+            "volume_ratio": volume_ratio,
+            "volume_available": volume_available,
+            "volume_status": "OK" if volume_available else "N/D (Yahoo)",
             "or_high": safe_float(row["or_high"]),
             "or_low": safe_float(row["or_low"]),
             "or_pos": safe_float(row["or_pos"], 0.5),
-            "updated": str(today.index[-1]),
+            "updated": str(today_for_signal.index[-1]),
             **status,
         }
     except Exception as exc:
@@ -226,7 +251,9 @@ def _confirmation_logic(pre_signal: str, state: Dict, min_bars: int | None = Non
     vwap = safe_float(state.get("vwap"), current)
     ret15 = safe_float(state.get("ret15m"))
     session_ret = safe_float(state.get("session_ret"))
-    vol_ratio = safe_float(state.get("volume_ratio"), 1.0)
+    raw_vol_ratio = state.get("volume_ratio")
+    volume_available = bool(state.get("volume_available", raw_vol_ratio is not None))
+    vol_ratio = safe_float(raw_vol_ratio, 1.0)
     or_pos = safe_float(state.get("or_pos"), 0.5)
 
     long_points = int(current > opening) + int(current >= vwap) + int(ret15 > 0) + int(session_ret > 0)
@@ -234,7 +261,9 @@ def _confirmation_logic(pre_signal: str, state: Dict, min_bars: int | None = Non
     if bars >= DEFAULTS["day_opening_range_bars"]:
         long_points += int(or_pos >= 0.60)
         short_points += int(or_pos <= 0.40)
-    if vol_ratio >= 1.10:
+    # Missing Yahoo volume is neutral: it must never create a false negative
+    # nor a false confirmation. The volume point is used only when trustworthy.
+    if volume_available and vol_ratio >= 1.10:
         if session_ret > 0:
             long_points += 1
         elif session_ret < 0:
@@ -285,7 +314,9 @@ def confirm_open(ticker: str, pre: Dict, state: Dict | None = None) -> Dict:
             "ret30m": 0.0,
             "ret60m": 0.0,
             "session_ret": 0.0,
-            "volume_ratio": 1.0,
+            "volume_ratio": None,
+            "volume_available": False,
+            "volume_status": "N/D (mercato chiuso)",
             "or_pos": 0.5,
         }
 
