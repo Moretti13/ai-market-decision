@@ -2,11 +2,12 @@ name: AI Market Decision - Cloud Radar
 
 on:
   schedule:
+    # Every 15 minutes, offset from the top of the hour to reduce scheduler congestion.
+    # 04:07-15:52 America/New_York covers US premarket + regular session.
     - cron: '7,22,37,52 4-14 * * 1-5'
       timezone: 'America/New_York'
     - cron: '7,22 15 * * 1-5'
       timezone: 'America/New_York'
-
   workflow_dispatch:
     inputs:
       force_run:
@@ -31,7 +32,6 @@ jobs:
   radar:
     runs-on: ubuntu-latest
     timeout-minutes: 14
-
     env:
       PYTHONUNBUFFERED: '1'
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -49,8 +49,8 @@ jobs:
       RADAR_ENTRY_CUTOFF_ET: ${{ vars.RADAR_ENTRY_CUTOFF_ET }}
       RADAR_CAPITAL: ${{ vars.RADAR_CAPITAL }}
       RADAR_RISK_PCT: ${{ vars.RADAR_RISK_PCT }}
-      RADAR_FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run || false }}
-      RADAR_SEND_SUMMARY: ${{ github.event_name == 'workflow_dispatch' && inputs.send_summary || false }}
+      RADAR_FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run && 'true' || 'false' }}
+      RADAR_SEND_SUMMARY: ${{ github.event_name == 'workflow_dispatch' && inputs.send_summary && 'true' || 'false' }}
 
     steps:
       - name: Checkout
@@ -67,7 +67,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .radar_state
-          key: radar-state-${{ runner.os }}-${{ github.run_id }}
+          key: radar-state-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             radar-state-${{ runner.os }}-
 
@@ -93,4 +93,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .radar_state
-          key: radar-state-${{ runner.os }}-${{ github.run_id }}
+          key: radar-state-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
