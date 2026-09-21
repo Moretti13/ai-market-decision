@@ -6,7 +6,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from alerts import send_telegram, telegram_configured
+from alerts import send_telegram, send_telegram_detailed, telegram_configured
 from config import ALL_UNIVERSE, DEFAULTS
 from db import event_exists, record_event_once
 from market_clock import market_status
@@ -221,10 +221,12 @@ def run_cloud_radar(*, force_run: bool = False, send_summary: bool = False) -> d
         except Exception as exc:
             result["errors"].append(f"{ticker}: {exc}")
 
+    result["summary_requested"] = bool(send_summary)
+    result["summary_sent"] = False
     if send_summary:
         top = df.head(min(3, len(df)))
         lines = [
-            "🧪 AI Market Decision V7.4 — Cloud Radar test",
+            "🧪 AI Market Decision V7.4.1 — Cloud Radar test",
             f"Mercato: {clock.get('status', 'UNKNOWN')}",
             f"Asset analizzati: {result['scanned']}",
             f"Alert inviati: {result['sent']} (confirmed {result['confirmed']}, watch {result['watch']})",
@@ -233,5 +235,9 @@ def run_cloud_radar(*, force_run: bool = False, send_summary: bool = False) -> d
             lines.append(f"{row.get('ticker')}: {row.get('DAY')} · {float(row.get('DAY_score', 0)):.1f}/100")
         if result["errors"]:
             lines.append(f"Errori: {len(result['errors'])}")
-        send_telegram("\n".join(lines))
+        diag = send_telegram_detailed("\n".join(lines))
+        result["summary_sent"] = bool(diag.get("ok"))
+        result["telegram_status_code"] = diag.get("status_code")
+        if not diag.get("ok"):
+            result["errors"].append(f"Telegram summary failed: {diag.get('error') or 'unknown error'}")
     return result
