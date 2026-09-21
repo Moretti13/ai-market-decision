@@ -1,0 +1,96 @@
+name: AI Market Decision - Cloud Radar
+
+on:
+  schedule:
+    # Every 15 minutes, offset from the top of the hour to reduce scheduler congestion.
+    # 04:07-15:52 America/New_York covers US premarket + regular session.
+    - cron: '7,22,37,52 4-14 * * 1-5'
+      timezone: 'America/New_York'
+    - cron: '7,22 15 * * 1-5'
+      timezone: 'America/New_York'
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Esegui anche fuori da premarket/sessione regolare'
+        required: false
+        default: true
+        type: boolean
+      send_summary:
+        description: 'Invia un riepilogo Telegram di test'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ai-market-cloud-radar
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    env:
+      PYTHONUNBUFFERED: '1'
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      MARKET_DB_PATH: ${{ github.workspace }}/.radar_state/radar.db
+      MODEL_CACHE_DIR: ${{ github.workspace }}/.radar_state/models
+      RADAR_STATE_DIR: ${{ github.workspace }}/.radar_state
+      RADAR_TICKERS: ${{ vars.RADAR_TICKERS }}
+      RADAR_ASSETS: ${{ vars.RADAR_ASSETS }}
+      RADAR_WORKERS: ${{ vars.RADAR_WORKERS }}
+      RADAR_ALERT_SCORE: ${{ vars.RADAR_ALERT_SCORE }}
+      RADAR_NOTIFY_WATCH: ${{ vars.RADAR_NOTIFY_WATCH }}
+      RADAR_MAX_ALERTS: ${{ vars.RADAR_MAX_ALERTS }}
+      RADAR_ENTRY_CUTOFF_ET: ${{ vars.RADAR_ENTRY_CUTOFF_ET }}
+      RADAR_CAPITAL: ${{ vars.RADAR_CAPITAL }}
+      RADAR_RISK_PCT: ${{ vars.RADAR_RISK_PCT }}
+      RADAR_FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run || false }}
+      RADAR_SEND_SUMMARY: ${{ github.event_name == 'workflow_dispatch' && inputs.send_summary || false }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements_worker.txt
+
+      - name: Restore radar state and trained DAY models
+        uses: actions/cache/restore@v4
+        with:
+          path: .radar_state
+          key: radar-state-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            radar-state-${{ runner.os }}-
+
+      - name: Prepare persistent state directory
+        run: mkdir -p .radar_state/models
+
+      - name: Install worker dependencies
+        run: python -m pip install -r requirements_worker.txt
+
+      - name: Validate Telegram secrets
+        shell: bash
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in GitHub repository secrets."
+            exit 2
+          fi
+
+      - name: Run cloud radar
+        run: python cloud_radar.py
+
+      - name: Save radar state and trained DAY models
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .radar_state
+          key: radar-state-${{ runner.os }}-${{ github.run_id }}

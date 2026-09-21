@@ -20,6 +20,7 @@ from news_engine import score_title  # noqa: E402
 from signal_engine import _confirmation_logic, confirm_open  # noqa: E402
 from scanner import _opportunity_detail  # noqa: E402
 from portfolio import position_pnl  # noqa: E402
+from radar_engine import _event_key, configured_universe  # noqa: E402
 
 
 def synthetic_ohlcv(n=500):
@@ -149,6 +150,59 @@ class CoreTests(unittest.TestCase):
         bt = _backtest_frame(frame, MODEL_FEATURES, "WEEK", max_folds=20)
         self.assertIn("cumulative_return", bt)
         self.assertGreaterEqual(bt["folds_tested"], 1)
+
+    def test_cloud_radar_event_key_changes_by_state(self):
+        a = _event_key("NVDA", "BUY WATCH", "BUY")
+        b = _event_key("NVDA", "ENTRY_CONFIRMED", "LONG")
+        self.assertNotEqual(a, b)
+        self.assertIn("NVDA", a)
+
+    def test_cloud_radar_custom_universe(self):
+        old = os.environ.get("RADAR_TICKERS")
+        os.environ["RADAR_TICKERS"] = "NVDA, AAPL, NVDA"
+        try:
+            self.assertEqual(configured_universe(), ["NVDA", "AAPL"])
+        finally:
+            if old is None:
+                os.environ.pop("RADAR_TICKERS", None)
+            else:
+                os.environ["RADAR_TICKERS"] = old
+
+    def test_cloud_radar_skips_when_market_not_live(self):
+        from unittest.mock import patch
+        from radar_engine import run_cloud_radar
+        closed = {"status": "CLOSED", "is_pre": False, "is_open": False, "closed_reason": "WEEKEND"}
+        with patch("radar_engine.market_status", return_value=closed), patch("radar_engine.scanner") as scan_mock:
+            out = run_cloud_radar(force_run=False, send_summary=False)
+            self.assertEqual(out["scanned"], 0)
+            scan_mock.assert_not_called()
+
+    def test_cloud_radar_confirmed_alert_path(self):
+        from unittest.mock import patch
+        from radar_engine import run_cloud_radar
+        live = {"status": "REGULAR SESSION", "is_pre": False, "is_open": True, "closed_reason": None}
+        frame = pd.DataFrame([{
+            "ticker": "NVDA", "DAY": "PRE-BUY", "DAY_side": "BUY", "DAY_score": 88.0,
+            "DAY_prob": 70.0, "DAY_exp": 0.8, "DAY_quality": 70.0, "DAY_reason": "ok",
+            "event_risk": "NORMAL", "regime": "RISK-ON",
+        }])
+        detail = {
+            "ticker": "NVDA",
+            "confirm": {"status": "CONFIRMED", "signal": "ENTER BUY", "bars": 4, "volume_status": "OK"},
+            "plan": {"status": "READY", "side": "LONG", "entry": 100.0, "stop": 98.0, "target": 104.0, "rr": 2.0, "shares": 10},
+            "pre": {"p_up": 0.70, "confidence": 0.75},
+            "events": {"event_risk": "NORMAL"},
+        }
+        with patch("radar_engine.market_status", return_value=live), \
+             patch("radar_engine.telegram_configured", return_value=True), \
+             patch("radar_engine.scanner", return_value=frame), \
+             patch("radar_engine.analyze_day_fast", return_value=detail), \
+             patch("radar_engine.event_exists", return_value=False), \
+             patch("radar_engine.send_telegram", return_value=True), \
+             patch("radar_engine.record_event_once", return_value=True):
+            out = run_cloud_radar(force_run=False, send_summary=False)
+            self.assertEqual(out["sent"], 1)
+            self.assertEqual(out["confirmed"], 1)
 
 
 class DatabaseTests(unittest.TestCase):

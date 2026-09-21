@@ -72,12 +72,12 @@ def notify_scanner_candidates(df: pd.DataFrame, horizon: str, threshold: float, 
             continue
         result["eligible"] += 1
         ticker_row = str(row.get("ticker", "")).upper()
-        event_key = f"V73|RADAR|{day_key}|{horizon}|{ticker_row}|{state}"
+        event_key = f"V74|RADAR|{day_key}|{horizon}|{ticker_row}|{state}"
         if event_exists(event_key):
             result["skipped"] += 1
             continue
         message = (
-            f"📡 AI Market Decision V7.3 RADAR\n"
+            f"📡 AI Market Decision V7.4 RADAR\n"
             f"{ticker_row} · {horizon} · {state}\n"
             f"Opportunity score: {score:.1f}/100\n"
             f"P(up): {float(row.get(prob_col, 50.0)):.1f}%\n"
@@ -283,10 +283,10 @@ def render_analysis(r: dict):
         if record_event_once(
             event_key, ticker, "DAY", confirm.get("signal", ""),
             plan.get("entry", 0.0), plan.get("stop", 0.0), plan.get("target", 0.0),
-            notes="V7.3.2 confirmed DAY signal",
+            notes="V7.4 confirmed DAY signal",
         ):
             send_telegram(
-                f"AI Market Decision V7.3.2\n{ticker} DAY\n{confirm.get('signal')}\n"
+                f"AI Market Decision V7.4\n{ticker} DAY\n{confirm.get('signal')}\n"
                 f"Entry {plan.get('entry', 0):.2f}\nStop {plan.get('stop', 0):.2f}\nTarget {plan.get('target', 0):.2f}\n"
                 f"P(up) {pre.get('p_up', .5)*100:.1f}%\nEvent risk {pre.get('event_risk')}"
             )
@@ -305,7 +305,7 @@ with st.sidebar:
     ) / 100
     if risk_pct > 0.02:
         st.warning("Per il paper test stai usando un rischio >2% per operazione: è un'impostazione aggressiva.")
-    auto = st.toggle("Ricalcolo automatico asset", value=False, help="Se attivo, V7.3.2 ricalcola il ticker selezionato solo in premarket/sessione regolare. 15 minuti è l’impostazione più leggera.")
+    auto = st.toggle("Ricalcolo automatico asset", value=False, help="Se attivo, V7.4 ricalcola il ticker selezionato solo in premarket/sessione regolare. 15 minuti è l’impostazione più leggera.")
     refresh_minutes = st.selectbox("Intervallo asset", [5, 10, 15], index=2, disabled=not auto)
     if st.button("🔄 Ricalcola ora", type="primary"):
         st.session_state["refresh_nonce"] = int(st.session_state.get("refresh_nonce", 0)) + 1
@@ -359,7 +359,7 @@ st.divider()
 tabs = st.tabs(["🔎 Scanner", "📊 Backtest", "✅ Verifica previsioni", "💼 Posizioni", "🛠️ Sistema"])
 
 with tabs[0]:
-    st.subheader("Market Scanner V7.3 — WATCH + Radar")
+    st.subheader("Market Scanner V7.4 — WATCH + Cloud Radar")
     c1, c2, c3 = st.columns(3)
     scan_n = c1.slider("Numero asset", 3, min(15, len(ALL_UNIVERSE)), int(DEFAULTS["scanner_assets"]))
     horizon_view = c2.selectbox("Vista", ["DAY", "WEEK", "MONTH"])
@@ -371,9 +371,9 @@ with tabs[0]:
         with st.spinner(f"Scansione {horizon_view} controllata..."):
             st.session_state["scan_df_v7"] = cached_scanner(scan_n, horizon_view, nonce_scan)
 
-    st.markdown("#### 📡 Radar automatico + Telegram")
+    st.markdown("#### 📡 Radar Streamlit (fallback) + Telegram")
     r1, r2, r3, r4 = st.columns(4)
-    radar_enabled = r1.toggle("Radar automatico", value=False, help="Scansiona DAY automaticamente mentre l'app Streamlit è sveglia.")
+    radar_enabled = r1.toggle("Radar automatico", value=False, help="Fallback locale: scansiona DAY solo mentre Streamlit è sveglio. Per PC spento usa il Cloud Radar GitHub Actions V7.4.")
     radar_interval = r2.selectbox("Ogni", [15, 30, 60], index=0, format_func=lambda x: f"{x} min", disabled=not radar_enabled)
     radar_threshold = r3.slider("Score alert", 60, 95, int(DEFAULTS.get("scanner_alert_score", 75)), disabled=not radar_enabled)
     radar_watch = r4.toggle("Notifica WATCH", value=True, disabled=not radar_enabled)
@@ -480,7 +480,7 @@ with tabs[3]:
         for ev in monitor.get("events", []):
             key = f"V73|POSITION|{ev['id']}|{ev['reason']}"
             if record_event_once(key, ev["ticker"], "POSITION", ev["reason"], ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}"):
-                send_telegram(f"AI Market Decision V7.3\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
+                send_telegram(f"AI Market Decision V7.4\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
     monitor = st.session_state.get("paper_monitor", {"updated": 0, "closed": 0, "events": [], "errors": []})
     if monitor.get("updated") or monitor.get("closed"):
         st.info(f"Paper tracker: aggiornate {monitor.get('updated', 0)} · chiuse {monitor.get('closed', 0)}")
@@ -494,7 +494,7 @@ with tabs[3]:
         if st.button("➕ Registra piano come PAPER POSITION"):
             pid = open_position(
                 ticker, "DAY", plan["side"], int(plan["shares"]), float(plan["entry"]),
-                float(plan["stop"]), float(plan["target"]), notes="V7.3 current DAY plan",
+                float(plan["stop"]), float(plan["target"]), notes="V7.4 current DAY plan",
             )
             st.success(f"Paper position registrata (ID {pid}).")
     else:
@@ -509,7 +509,7 @@ with tabs[3]:
         ms = st.number_input("Stop", min_value=0.0, value=max(0.0, float(plan.get("stop", 0.0) or 0.0)), key="ms")
         mt = st.number_input("Target", min_value=0.0, value=max(0.0, float(plan.get("target", 0.0) or 0.0)), key="mt")
         if st.button("Salva posizione manuale"):
-            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7.3 manual paper position")
+            pid = open_position(mticker, mhorizon, mside, int(mq), float(me), float(ms) or None, float(mt) or None, notes="V7.4 manual paper position")
             st.success(f"Posizione {pid} salvata.")
 
     open_df = open_positions()
@@ -537,7 +537,8 @@ with tabs[4]:
         "data_source": "Yahoo Finance via yfinance",
         "database": "PostgreSQL se DATABASE_URL è configurato, altrimenti SQLite locale",
     })
-    st.info("V7.3 aggiunge Opportunity Score/WATCH, Radar DAY automatico e alert Telegram deduplicati. Training e inference restano separati e il Radar DAY calcola un solo orizzonte per contenere CPU.")
+    st.info("V7.4 aggiunge un Cloud Radar indipendente da Streamlit tramite GitHub Actions. Il Radar Streamlit resta come fallback; il worker cloud usa DAY + conferma 5m, cache modelli e Telegram.")
+    st.caption("Cloud Radar: .github/workflows/cloud_radar.yml · pianificazione ogni 15 minuti nei giorni feriali, con controllo reale di sessione/holiday nel worker.")
     if st.button("🧠 Forza retraining modelli del ticker"):
         removed = clear_model_cache(ticker)
         cached_analysis.clear()
@@ -545,7 +546,7 @@ with tabs[4]:
         st.success(f"Cache modelli di {ticker} azzerata ({removed} file). Al prossimo ricalcolo verranno riaddestrati.")
 
     if st.button("📨 Test Telegram"):
-        if send_telegram("AI Market Decision V7.3 — test alert OK"):
+        if send_telegram("AI Market Decision V7.4 — test alert OK"):
             st.success("Messaggio Telegram inviato.")
         else:
             st.warning("Telegram non configurato o invio fallito. Controlla TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nei Secrets.")
@@ -567,7 +568,7 @@ with tabs[4]:
         )
     st.markdown(
         """
-        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7.3 non invia ordini e non garantisce profitti.\n\n
+        **Prima dell'uso reale:** esegui paper trading, verifica le previsioni maturate, controlla backtest e costi, e confronta i segnali con dati live affidabili. V7.4 non invia ordini e non garantisce profitti.\n\n
         **Short:** ENTER SELL/SHORT richiede un conto che consenta la vendita allo scoperto; altrimenti interpreta SELL come uscita/avoid.\n\n
         **Persistenza:** su Streamlit Cloud usa PostgreSQL/Supabase tramite `DATABASE_URL`; il filesystem locale può essere ricreato nei redeploy.
         """
@@ -579,7 +580,7 @@ payload = json.dumps(st.session_state["analysis"], default=str, ensure_ascii=Fal
 st.download_button(
     "⬇️ Esporta analisi JSON",
     data=payload.encode("utf-8"),
-    file_name=f"{ticker}_analysis_v7_2.json",
+    file_name=f"{ticker}_analysis_v7_4.json",
     mime="application/json",
 )
 st.caption(f"AI Market Decision V{APP_VERSION} · {APP_BUILD} · refresh {refresh_minutes if auto else 'manuale'} min")

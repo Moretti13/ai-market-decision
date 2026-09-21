@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-APP_NAME = "AI Market Decision V7.3.2 Radar"
-APP_VERSION = "7.3.2"
-APP_BUILD = "V7.3.2-YAHOO-DATA-HOTFIX"
+APP_NAME = "AI Market Decision V7.4 Cloud Radar"
+APP_VERSION = "7.4.0"
+APP_BUILD = "V7.4-CLOUD-RADAR"
 
 US_STOCKS = [
     "NVDA", "AMD", "AVGO", "MSFT", "AMZN", "META", "GOOGL", "AAPL", "TSLA", "NFLX",
@@ -42,6 +42,9 @@ DEFAULTS = {
     "scanner_alert_score": 75.0,
     "radar_interval_minutes": 15,
     "radar_assets": 5,
+    "radar_confirm_floor": 60.0,
+    "radar_max_alerts": 3,
+    "radar_entry_cutoff_et": "15:30",
     "buy_prob": 0.64,
     "sell_prob": 0.36,
     "day_min_edge": 0.0035,

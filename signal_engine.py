@@ -388,7 +388,14 @@ def trade_plan(ticker: str, pre: Dict, confirm: Dict, capital: float, risk_pct: 
     }
 
 
-def analyze_asset(ticker: str, capital: float = 10_000.0, risk_pct: float = 0.01, include_fundamentals: bool = True) -> Dict:
+def analyze_day_fast(ticker: str, capital: float = 10_000.0, risk_pct: float = 0.01, include_health: bool = False) -> Dict:
+    """DAY-only analysis for the cloud radar.
+
+    It deliberately avoids WEEK/MONTH training and fundamentals, so a scheduled
+    worker can re-evaluate intraday conditions cheaply every 15 minutes. The DAY
+    model itself remains persisted and is retrained only when its completed-daily
+    data-as-of changes.
+    """
     t = ticker.strip().upper()
     if not t:
         raise ValueError("Inserisci un ticker")
@@ -403,6 +410,24 @@ def analyze_asset(ticker: str, capital: float = 10_000.0, risk_pct: float = 0.01
         pre["score"] = round(pre["decision_score"], 1)
     confirm = confirm_open(t, pre, intraday if intraday is not None else None)
     plan = trade_plan(t, pre, confirm, capital, risk_pct, events)
+    out = {
+        "ticker": t,
+        "clock": clock,
+        "pre": pre,
+        "confirm": confirm,
+        "plan": plan,
+        "events": events,
+        "regime": regime,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if include_health:
+        out["health"] = data_health(t, live=bool(clock.get("is_open") or clock.get("is_pre")))
+    return out
+
+
+def analyze_asset(ticker: str, capital: float = 10_000.0, risk_pct: float = 0.01, include_fundamentals: bool = True) -> Dict:
+    day = analyze_day_fast(ticker, capital, risk_pct, include_health=True)
+    t = day["ticker"]
 
     try:
         week = train_medium_model(t, "WEEK")
@@ -414,18 +439,10 @@ def analyze_asset(ticker: str, capital: float = 10_000.0, risk_pct: float = 0.01
         month = {"signal": "N/A", "p_up": 0.5, "p_down": 0.5, "expected_return": 0.0, "quality_score": 0.0, "error": str(exc)}
 
     return {
-        "ticker": t,
-        "clock": clock,
-        "pre": pre,
-        "confirm": confirm,
-        "plan": plan,
+        **day,
         "week": week,
         "month": month,
-        "events": events,
-        "news": events.get("news", {}).get("items", []),
+        "news": day["events"].get("news", {}).get("items", []),
         "fundamentals": current_fundamentals(t) if include_fundamentals else {},
-        "regime": regime,
-        "macro": regime.get("macro", {}),
-        "health": data_health(t, live=bool(clock.get("is_open") or clock.get("is_pre"))),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "macro": day["regime"].get("macro", {}),
     }

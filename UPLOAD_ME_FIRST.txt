@@ -1,0 +1,9 @@
+V7.4 CLOUD RADAR
+
+Carica il contenuto di questa cartella nella ROOT del repository.
+IMPORTANTE: il file cloud_radar.yml deve finire esattamente in:
+.github/workflows/cloud_radar.yml
+
+Se il tuo computer non mostra la cartella .github, usa il file cloud_radar_WORKFLOW_COPY.yml come copia e crea manualmente su GitHub il percorso .github/workflows/cloud_radar.yml incollandone il contenuto.
+
+Dopo il commit, configura i GitHub Actions Secrets TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID.
