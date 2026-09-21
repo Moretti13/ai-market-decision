@@ -122,6 +122,27 @@ class CoreTests(unittest.TestCase):
 
 
 class DatabaseTests(unittest.TestCase):
+    def test_concurrent_database_init_is_idempotent(self):
+        import concurrent.futures
+        import db
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "concurrent.db"
+            old = os.environ.get("DATABASE_URL")
+            os.environ["DATABASE_URL"] = f"sqlite:///{path}"
+            db.reset_engine_cache()
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = [pool.submit(db.init_db) for _ in range(24)]
+                    for f in futures:
+                        f.result(timeout=10)
+                self.assertFalse(db.event_exists("not-present"))
+            finally:
+                db.reset_engine_cache()
+                if old is None:
+                    os.environ.pop("DATABASE_URL", None)
+                else:
+                    os.environ["DATABASE_URL"] = old
+
     def test_database_roundtrip(self):
         import db
         with tempfile.TemporaryDirectory() as td:

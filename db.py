@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from sqlalchemy import Column, Double, Integer, MetaData, String, Table, create_engine, insert, select, update
+from sqlalchemy import Column, Double, Integer, MetaData, String, Table, create_engine, event, insert, select, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.schema import CreateTable
 
 DB_FILE = Path(os.getenv("MARKET_DB_PATH", str(Path.home() / ".ai_market_decision" / "market_decision_v7.db")))
 DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 _ENGINE_CACHE: dict[str, Engine] = {}
+_INIT_LOCK = threading.RLock()
+_INITIALIZED_URLS: set[str] = set()
 
 
 def _secret(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -41,19 +45,31 @@ def engine() -> Engine:
     if url not in _ENGINE_CACHE:
         kwargs = {"pool_pre_ping": True, "future": True}
         if url.startswith("sqlite"):
-            kwargs["connect_args"] = {"check_same_thread": False}
-        _ENGINE_CACHE[url] = create_engine(url, **kwargs)
+            kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+        eng = create_engine(url, **kwargs)
+        if url.startswith("sqlite"):
+            @event.listens_for(eng, "connect")
+            def _sqlite_pragmas(dbapi_connection, _connection_record):
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA busy_timeout=30000")
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                finally:
+                    cursor.close()
+        _ENGINE_CACHE[url] = eng
     return _ENGINE_CACHE[url]
 
 
 def reset_engine_cache() -> None:
-    global _ENGINE_CACHE
-    for eng in _ENGINE_CACHE.values():
-        try:
-            eng.dispose()
-        except Exception:
-            pass
-    _ENGINE_CACHE = {}
+    global _ENGINE_CACHE, _INITIALIZED_URLS
+    with _INIT_LOCK:
+        for eng in _ENGINE_CACHE.values():
+            try:
+                eng.dispose()
+            except Exception:
+                pass
+        _ENGINE_CACHE = {}
+        _INITIALIZED_URLS = set()
 
 
 metadata = MetaData()
@@ -124,7 +140,25 @@ paper_positions_v7 = Table(
 
 
 def init_db() -> None:
-    metadata.create_all(engine())
+    """Create schema once per database URL, safely across Streamlit reruns/threads.
+
+    V7.3 can run the main app and Radar fragment close together. SQLAlchemy's
+    normal check-before-create can race on SQLite: two callers can both see a
+    missing table and then one receives ``table already exists``. Using a
+    process lock plus ``CREATE TABLE IF NOT EXISTS`` makes initialization
+    idempotent and avoids that startup race.
+    """
+    eng = engine()
+    key = str(eng.url)
+    if key in _INITIALIZED_URLS:
+        return
+    with _INIT_LOCK:
+        if key in _INITIALIZED_URLS:
+            return
+        with eng.begin() as conn:
+            for table in metadata.sorted_tables:
+                conn.execute(CreateTable(table, if_not_exists=True))
+        _INITIALIZED_URLS.add(key)
 
 
 def _utcnow() -> str:
