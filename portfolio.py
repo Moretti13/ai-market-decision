@@ -99,6 +99,28 @@ def _intraday_level_exit(row) -> tuple[str, float] | None:
     return None
 
 
+def _day_session_exit_price(row, fallback: float) -> float:
+    """Use the regular-session close for DAY end-of-session exits, not after-hours."""
+    try:
+        bars = latest_regular(str(row["ticker"]))
+        if bars is None or bars.empty:
+            return float(fallback)
+        from market_clock import session_hours
+        tz, _ = session_hours(str(row["ticker"]))
+        created = pd.Timestamp(row.get("created_at"))
+        if created.tzinfo is None:
+            created = created.tz_localize("UTC")
+        created_date = created.tz_convert(tz).date()
+        local_dates = bars.index.tz_convert(tz).date
+        session_bars = bars.loc[local_dates == created_date]
+        if session_bars.empty:
+            return float(fallback)
+        px = safe_float(session_bars["Close"].iloc[-1], float(fallback))
+        return float(px if px > 0 else fallback)
+    except Exception:
+        return float(fallback)
+
+
 def monitor_open_positions(auto_close_levels: bool = True, close_at_session_end: bool = True) -> Dict:
     positions = open_positions()
     events: List[Dict] = []
@@ -142,7 +164,8 @@ def monitor_open_positions(auto_close_levels: bool = True, close_at_session_end:
             if reason is None and close_at_session_end and str(row.get("horizon", "")).upper() == "DAY":
                 status = market_status(str(row["ticker"]))
                 if _day_position_is_stale(row, status):
-                    reason, exit_price = "SESSION_END", price
+                    reason = "SESSION_END"
+                    exit_price = _day_session_exit_price(row, price)
 
             exit_pnl = position_pnl(row["side"], int(row["quantity"]), float(row["entry"]), exit_price)
             if reason and close_position_once(int(row["id"]), exit_price, exit_pnl, reason):
