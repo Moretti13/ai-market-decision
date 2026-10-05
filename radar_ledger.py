@@ -60,13 +60,24 @@ def _exit_message(trade: dict) -> str:
     )
 
 
+def radar_positions(limit: int = 5000) -> pd.DataFrame:
+    """Return only positions automatically opened by the Cloud Radar."""
+    df = all_positions(limit)
+    if df.empty:
+        return df
+    notes = df.get("notes", pd.Series("", index=df.index)).fillna("").astype(str)
+    mask = notes.str.contains("Cloud Radar V7.5", case=False, regex=False)
+    return df.loc[mask].copy()
+
+
 def register_confirmed_trade(detail: dict, event_key: str, score: float) -> dict:
     ticker = str(detail.get("ticker", "")).upper()
     plan = detail.get("plan", {}) or {}
     if not ticker or plan.get("status") != "READY":
         return {"opened": False, "reason": "PLAN_NOT_READY"}
 
-    existing = open_positions()
+    existing = radar_positions()
+    existing = existing[existing["status"].astype(str).str.upper() == "OPEN"] if not existing.empty else existing
     if not existing.empty:
         mask = (existing["ticker"].astype(str).str.upper() == ticker) & (existing["horizon"].astype(str).str.upper() == "DAY")
         if bool(mask.any()):
@@ -118,7 +129,8 @@ def _first_exit_from_bars(side: str, stop: float, target: float, bars: pd.DataFr
 
 def reconcile_open_positions(*, now_et: datetime | None = None, notify: bool = True) -> dict:
     now_et = now_et.astimezone(NY) if now_et else datetime.now(NY)
-    opened = open_positions()
+    opened = radar_positions()
+    opened = opened[opened["status"].astype(str).str.upper() == "OPEN"] if not opened.empty else opened
     result = {"checked": int(len(opened)), "closed": [], "open": int(len(opened)), "errors": []}
     if opened.empty:
         export_trade_ledger()
@@ -170,13 +182,14 @@ def reconcile_open_positions(*, now_et: datetime | None = None, notify: bool = T
         except Exception as exc:
             result["errors"].append(f"{pos.get('ticker', '?')}: {type(exc).__name__}: {exc}")
 
-    result["open"] = int(len(open_positions()))
+    remaining = radar_positions()
+    result["open"] = int((remaining["status"].astype(str).str.upper() == "OPEN").sum()) if not remaining.empty else 0
     export_trade_ledger()
     return result
 
 
 def paper_metrics() -> dict:
-    df = all_positions(5000)
+    df = radar_positions(5000)
     if df.empty:
         return {"trades": 0, "closed": 0, "open": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pnl": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0}
     closed = df[df["status"].astype(str).str.upper() == "CLOSED"].copy()
@@ -205,7 +218,7 @@ def paper_metrics() -> dict:
 
 def export_trade_ledger() -> dict:
     state = _state_dir()
-    positions = all_positions(5000)
+    positions = radar_positions(5000)
     events = recent_events(5000)
     if not positions.empty:
         positions.sort_values("id").to_csv(state / "trade_ledger.csv", index=False)
@@ -222,7 +235,7 @@ def export_trade_ledger() -> dict:
 
 def daily_summary_message(now_et: datetime | None = None) -> str:
     now_et = now_et.astimezone(NY) if now_et else datetime.now(NY)
-    df = all_positions(5000)
+    df = radar_positions(5000)
     metrics = paper_metrics()
     today_closed = pd.DataFrame()
     if not df.empty:
