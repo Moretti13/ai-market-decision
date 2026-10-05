@@ -4,6 +4,7 @@ import json
 import os
 import time as time_module
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from config import DEFAULTS
@@ -72,7 +73,11 @@ def _seconds_until(target: datetime) -> float:
 
 def run_once(*, force_run: bool = False, send_summary: bool = False) -> dict:
     result = run_cloud_radar(force_run=force_run, send_summary=send_summary)
-    print(json.dumps(result, indent=2, ensure_ascii=False, default=str), flush=True)
+    payload = json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    print(payload, flush=True)
+    state_dir = Path(os.getenv("RADAR_STATE_DIR", ".radar_state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "last_run.json").write_text(payload, encoding="utf-8")
     try:
         export_trade_ledger()
     except Exception as exc:
