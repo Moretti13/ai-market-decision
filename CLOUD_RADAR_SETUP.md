@@ -29,13 +29,11 @@ In **Settings → Secrets and variables → Actions → Variables** puoi creare:
 Se non sono presenti, il worker usa i default del progetto.
 
 ## 3. Scheduler 15 minuti con recupero
-Per ogni slot logico da 15 minuti ci sono due trigger GitHub Actions:
-- primario: minuto 07/22/37/52;
-- backup: minuto 12/27/42/57.
+Il workflow riceve un wake-up ogni 5 minuti, sfalsato ai minuti 02/07/12/17/22/27/32/37/42/47/52/57. Il database raggruppa tre wake-up consecutivi nello stesso **slot logico da 15 minuti**.
 
-Entrambi vengono mappati allo stesso slot persistente nel database. Se il primario ha completato, il backup termina senza rilanciare lo scanner. Se il primario fallisce o resta bloccato, il backup può riprendere quello slot. I trigger continuano fino a dopo la chiusura USA per consentire l'uscita `SESSION_END`.
+Solo il primo tentativo che reclama lo slot esegue scanner e gestione trade; gli altri terminano subito. Se un tentativo fallisce, oppure resta RUNNING abbastanza a lungo da essere considerato stale, un wake-up successivo può recuperare lo stesso slot. I wake-up continuano fino alle 16:12 ET per consentire la chiusura `SESSION_END`.
 
-Questo riduce sensibilmente i buchi dovuti a ritardi/fallimenti e impedisce doppie aperture grazie alle chiavi persistenti. GitHub Actions resta comunque un servizio schedulato best-effort: non è corretto considerarlo un clock con SLA hard real-time.
+Questo dà tre opportunità per ogni finestra da 15 minuti senza triplicare scansioni o alert, e le chiavi persistenti impediscono doppie aperture. GitHub Actions resta comunque un servizio schedulato best-effort: non è corretto considerarlo un clock con SLA hard real-time.
 
 ## 4. Cutoff DAY 15:30 ET
 Alle **15:30 America/New_York** vengono bloccati soltanto i **nuovi ingressi DAY**. Il worker non interrompe la gestione delle posizioni già aperte: continua a controllare stop, target e fine sessione.
