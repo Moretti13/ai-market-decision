@@ -481,7 +481,7 @@ def trade_events(event_type: str | None = None, limit: int = 200) -> pd.DataFram
     query = select(paper_trade_events_v7)
     if event_type:
         query = query.where(paper_trade_events_v7.c.event_type == str(event_type).upper())
-    query = query.order_by(paper_trade_events_v7.c.id.asc()).limit(int(limit))
+    query = query.order_by(paper_trade_events_v7.c.id.desc()).limit(int(limit))
     with engine().connect() as conn:
         return pd.read_sql(query, conn)
 
