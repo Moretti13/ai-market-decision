@@ -1,17 +1,29 @@
-name: AI Market Decision - Cloud Radar
+name: AI Market Decision - Cloud Radar V7.5
 
 on:
   schedule:
-    # Every 15 minutes, offset from the top of the hour to reduce scheduler congestion.
-    # 04:07-15:52 America/New_York covers US premarket + regular session.
-    - cron: '7,22,37,52 4-14 * * 1-5'
+    # V7.5 no longer asks GitHub to fire ~46 cron events per day.
+    # GitHub only starts three blocks; the Python daemon owns the 15-minute
+    # cadence inside each running block.
+    - cron: '7 4 * * 1-5'
       timezone: 'America/New_York'
-    - cron: '7,22 15 * * 1-5'
+    - cron: '37 9 * * 1-5'
       timezone: 'America/New_York'
+    - cron: '5 16 * * 1-5'
+      timezone: 'America/New_York'
+
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'once = one scan; window = internal 15-minute loop'
+        required: true
+        default: 'once'
+        type: choice
+        options:
+          - once
+          - window
       force_run:
-        description: 'Esegui anche fuori da premarket/sessione regolare'
+        description: 'Forza una scansione anche fuori dalla finestra live'
         required: false
         default: true
         type: boolean
@@ -22,7 +34,7 @@ on:
         type: boolean
 
 concurrency:
-  group: ai-market-cloud-radar
+  group: ai-market-cloud-radar-v75
   cancel-in-progress: false
 
 permissions:
@@ -30,8 +42,9 @@ permissions:
 
 jobs:
   radar:
-    runs-on: ubuntu-latest
-    timeout-minutes: 14
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
     env:
       PYTHONUNBUFFERED: '1'
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -40,6 +53,7 @@ jobs:
       MARKET_DB_PATH: ${{ github.workspace }}/.radar_state/radar.db
       MODEL_CACHE_DIR: ${{ github.workspace }}/.radar_state/models
       RADAR_STATE_DIR: ${{ github.workspace }}/.radar_state
+
       RADAR_TICKERS: ${{ vars.RADAR_TICKERS }}
       RADAR_ASSETS: ${{ vars.RADAR_ASSETS }}
       RADAR_WORKERS: ${{ vars.RADAR_WORKERS }}
@@ -49,6 +63,9 @@ jobs:
       RADAR_ENTRY_CUTOFF_ET: ${{ vars.RADAR_ENTRY_CUTOFF_ET }}
       RADAR_CAPITAL: ${{ vars.RADAR_CAPITAL }}
       RADAR_RISK_PCT: ${{ vars.RADAR_RISK_PCT }}
+
+      RADAR_INTERVAL_MINUTES: '15'
+      RADAR_DAEMON_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'window' }}
       RADAR_FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run && 'true' || 'false' }}
       RADAR_SEND_SUMMARY: ${{ github.event_name == 'workflow_dispatch' && inputs.send_summary && 'true' || 'false' }}
 
@@ -63,15 +80,16 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements_worker.txt
 
-      - name: Restore radar state and trained DAY models
+      - name: Restore radar state, models and paper ledger
         uses: actions/cache/restore@v4
         with:
           path: .radar_state
-          key: radar-state-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: radar-v75-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            radar-v75-${{ runner.os }}-
             radar-state-${{ runner.os }}-
 
-      - name: Prepare persistent state directory
+      - name: Prepare state directory
         run: mkdir -p .radar_state/models
 
       - name: Install worker dependencies
@@ -85,12 +103,25 @@ jobs:
             exit 2
           fi
 
-      - name: Run cloud radar
-        run: python cloud_radar.py
+      - name: Run V7.5 radar scheduler
+        run: python radar_daemon.py
 
-      - name: Save radar state and trained DAY models
+      - name: Upload radar P/L ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-ledger-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .radar_state/trade_ledger.csv
+            .radar_state/signal_events.csv
+            .radar_state/performance_summary.json
+            .radar_state/last_run.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Save radar state, models and paper ledger
         if: always()
         uses: actions/cache/save@v4
         with:
           path: .radar_state
-          key: radar-state-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: radar-v75-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
