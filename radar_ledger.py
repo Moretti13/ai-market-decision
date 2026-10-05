@@ -76,8 +76,15 @@ def register_confirmed_trade(detail: dict, event_key: str, score: float) -> dict
     if not ticker or plan.get("status") != "READY":
         return {"opened": False, "reason": "PLAN_NOT_READY"}
 
-    existing = radar_positions()
-    existing = existing[existing["status"].astype(str).str.upper() == "OPEN"] if not existing.empty else existing
+    all_radar = radar_positions()
+    if not all_radar.empty:
+        prior_notes = all_radar.get("notes", pd.Series("", index=all_radar.index)).fillna("").astype(str)
+        same_event = prior_notes.str.contains(f"source={event_key}", case=False, regex=False)
+        if bool(same_event.any()):
+            row = all_radar.loc[same_event].iloc[-1]
+            return {"opened": False, "reason": "EVENT_ALREADY_TRACKED", "position_id": int(row["id"])}
+
+    existing = all_radar[all_radar["status"].astype(str).str.upper() == "OPEN"] if not all_radar.empty else all_radar
     if not existing.empty:
         mask = (existing["ticker"].astype(str).str.upper() == ticker) & (existing["horizon"].astype(str).str.upper() == "DAY")
         if bool(mask.any()):
@@ -149,7 +156,7 @@ def reconcile_open_positions(*, now_et: datetime | None = None, notify: bool = T
             entry_et = created.tz_convert(NY)
 
             bars = fetch(ticker, period="5d", interval="5m", prepost=False, force=True)
-            bars = bars[bars.index >= created.floor("5min")].copy() if not bars.empty else bars
+            bars = bars[bars.index >= created.ceil("5min")].copy() if not bars.empty else bars
             if bars.empty:
                 result["errors"].append(f"{ticker}: no bars after entry timestamp")
                 continue
