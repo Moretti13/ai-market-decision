@@ -225,18 +225,22 @@ class CoreTests(unittest.TestCase):
                 os.environ["RADAR_TICKERS"] = old
 
 
-    def test_cloud_scheduler_primary_and_backup_share_slot(self):
+    def test_cloud_scheduler_recovery_wakeups_share_15m_slot(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
         from cloud_radar import _scheduler_slot_key
         ny = ZoneInfo("America/New_York")
         old = os.environ.get("GITHUB_EVENT_SCHEDULE")
         try:
-            os.environ["GITHUB_EVENT_SCHEDULE"] = "7,22,37,52 4-15 * * 1-5"
-            primary = _scheduler_slot_key(datetime(2026, 9, 21, 10, 7, tzinfo=ny))
-            os.environ["GITHUB_EVENT_SCHEDULE"] = "12,27,42,57 4-15 * * 1-5"
-            backup = _scheduler_slot_key(datetime(2026, 9, 21, 10, 12, tzinfo=ny))
-            self.assertEqual(primary, backup)
+            os.environ["GITHUB_EVENT_SCHEDULE"] = "2,7,12,17,22,27,32,37,42,47,52,57 4-15 * * 1-5"
+            keys = [
+                _scheduler_slot_key(datetime(2026, 9, 21, 10, 2, tzinfo=ny)),
+                _scheduler_slot_key(datetime(2026, 9, 21, 10, 7, tzinfo=ny)),
+                _scheduler_slot_key(datetime(2026, 9, 21, 10, 12, tzinfo=ny)),
+            ]
+            self.assertEqual(len(set(keys)), 1)
+            next_slot = _scheduler_slot_key(datetime(2026, 9, 21, 10, 17, tzinfo=ny))
+            self.assertNotEqual(keys[0], next_slot)
         finally:
             if old is None:
                 os.environ.pop("GITHUB_EVENT_SCHEDULE", None)
