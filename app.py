@@ -480,8 +480,10 @@ with tabs[3]:
         st.session_state["paper_monitor"] = monitor
         for ev in monitor.get("events", []):
             key = f"V74|TRADE_NOTIFY|POSITION|{ev['id']}|EXIT"
-            if record_event_once(key, ev["ticker"], "POSITION", f"EXIT {ev['reason']}", ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}"):
-                send_telegram(f"AI Market Decision V7.4\n{ev['ticker']} PAPER EXIT\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:+.2f}")
+            if not event_exists(key):
+                message = f"AI Market Decision V7.4\n{ev['ticker']} PAPER EXIT\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:+.2f}"
+                if send_telegram(message):
+                    record_event_once(key, ev["ticker"], "POSITION", f"EXIT {ev['reason']}", ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}")
     monitor = st.session_state.get("paper_monitor", {"updated": 0, "closed": 0, "events": [], "errors": []})
     if monitor.get("updated") or monitor.get("closed"):
         st.info(f"Paper tracker: aggiornate {monitor.get('updated', 0)} · chiuse {monitor.get('closed', 0)}")
