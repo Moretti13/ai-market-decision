@@ -83,6 +83,9 @@ def main() -> int:
         if summary and not result.get("summary_sent", False):
             print("Telegram test summary was requested but was not delivered.")
             code = 3
+        elif result.get("failed", 0) or result.get("exit_failed", 0):
+            # Mark the slot failed so the backup trigger can retry unsent ENTRY/WATCH/EXIT alerts.
+            code = 2
         elif result.get("errors") and result.get("scanned", 0) == 0 and not result.get("positions_updated", 0):
             code = 2
 
