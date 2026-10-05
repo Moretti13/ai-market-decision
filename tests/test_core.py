@@ -19,7 +19,7 @@ from model_engine import _backtest_frame, _train_predict  # noqa: E402
 from news_engine import score_title  # noqa: E402
 from signal_engine import _confirmation_logic, confirm_open  # noqa: E402
 from scanner import _opportunity_detail  # noqa: E402
-from portfolio import _day_position_is_stale, position_pnl  # noqa: E402
+from portfolio import _day_position_is_stale, _intraday_level_exit, position_pnl  # noqa: E402
 from radar_engine import _entry_cutoff_reached, _event_key, configured_universe  # noqa: E402
 
 
@@ -150,6 +150,25 @@ class CoreTests(unittest.TestCase):
     def test_position_pnl(self):
         self.assertEqual(position_pnl("LONG", 10, 100, 105), 50)
         self.assertEqual(position_pnl("SHORT", 10, 100, 95), 50)
+
+
+    def test_day_stop_target_uses_post_entry_5m_touches(self):
+        from unittest.mock import patch
+        idx = pd.date_range("2026-09-21 14:05", periods=3, freq="5min", tz="UTC")
+        bars = pd.DataFrame({
+            "Open": [100.0, 100.0, 104.0],
+            "High": [101.0, 105.0, 104.5],
+            "Low": [90.0, 99.5, 103.0],
+            "Close": [100.0, 104.0, 103.5],
+            "Volume": [1000, 1000, 1000],
+        }, index=idx)
+        row = {
+            "ticker": "NVDA", "horizon": "DAY", "side": "LONG",
+            "created_at": "2026-09-21T14:07:00+00:00",
+            "stop": 95.0, "target": 104.0,
+        }
+        with patch("portfolio.latest_regular", return_value=bars):
+            self.assertEqual(_intraday_level_exit(row), ("TARGET", 104.0))
 
     def test_scanner_watch_score(self):
         near = _opportunity_detail("WAIT", 0.62, 0.0045, 0.60, 0.0035, "NORMAL")
