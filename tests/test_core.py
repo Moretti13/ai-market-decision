@@ -19,8 +19,8 @@ from model_engine import _backtest_frame, _train_predict  # noqa: E402
 from news_engine import score_title  # noqa: E402
 from signal_engine import _confirmation_logic, confirm_open  # noqa: E402
 from scanner import _opportunity_detail  # noqa: E402
-from portfolio import position_pnl  # noqa: E402
-from radar_engine import _event_key, configured_universe  # noqa: E402
+from portfolio import _day_position_is_stale, _day_session_exit_price, _intraday_level_exit, position_pnl  # noqa: E402
+from radar_engine import _entry_cutoff_reached, _event_key, configured_universe  # noqa: E402
 
 
 def synthetic_ohlcv(n=500):
@@ -95,6 +95,31 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(friday["status"], "PRE-MARKET")
         self.assertTrue(friday["is_pre"])
 
+
+    def test_day_entry_cutoff_is_exactly_1530_et(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        before = {"is_open": True, "now": datetime(2026, 9, 21, 15, 29, tzinfo=ny)}
+        at_cutoff = {"is_open": True, "now": datetime(2026, 9, 21, 15, 30, tzinfo=ny)}
+        self.assertFalse(_entry_cutoff_reached(before)[0])
+        self.assertTrue(_entry_cutoff_reached(at_cutoff)[0])
+
+    def test_day_position_closes_at_session_end_or_if_carried_overnight(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        row = {"horizon": "DAY", "created_at": "2026-09-21T14:00:00+00:00"}
+        post = {
+            "is_post": True, "is_open": False, "is_pre": False, "is_session_day": True,
+            "now": datetime(2026, 9, 21, 16, 5, tzinfo=ny), "close": datetime(2026, 9, 21, 16, 0, tzinfo=ny).time(),
+            "timezone": ny,
+        }
+        self.assertTrue(_day_position_is_stale(row, post))
+        overnight = dict(post)
+        overnight.update({"is_post": False, "is_pre": True, "now": datetime(2026, 9, 22, 8, 0, tzinfo=ny)})
+        self.assertTrue(_day_position_is_stale(row, overnight))
+
     def test_confirm_open_does_not_fetch_intraday_when_closed(self):
         from unittest.mock import patch
         closed = {
@@ -125,6 +150,37 @@ class CoreTests(unittest.TestCase):
     def test_position_pnl(self):
         self.assertEqual(position_pnl("LONG", 10, 100, 105), 50)
         self.assertEqual(position_pnl("SHORT", 10, 100, 95), 50)
+
+
+    def test_day_stop_target_uses_post_entry_5m_touches(self):
+        from unittest.mock import patch
+        idx = pd.date_range("2026-09-21 14:05", periods=3, freq="5min", tz="UTC")
+        bars = pd.DataFrame({
+            "Open": [100.0, 100.0, 104.0],
+            "High": [101.0, 105.0, 104.5],
+            "Low": [90.0, 99.5, 103.0],
+            "Close": [100.0, 104.0, 103.5],
+            "Volume": [1000, 1000, 1000],
+        }, index=idx)
+        row = {
+            "ticker": "NVDA", "horizon": "DAY", "side": "LONG",
+            "created_at": "2026-09-21T14:07:00+00:00",
+            "stop": 95.0, "target": 104.0,
+        }
+        with patch("portfolio.latest_regular", return_value=bars):
+            self.assertEqual(_intraday_level_exit(row), ("TARGET", 104.0))
+
+
+    def test_day_session_end_uses_regular_close_not_after_hours(self):
+        from unittest.mock import patch
+        idx = pd.date_range("2026-09-21 19:50", periods=2, freq="5min", tz="UTC")
+        bars = pd.DataFrame({
+            "Open": [101.0, 102.0], "High": [102.5, 103.0], "Low": [100.5, 101.5],
+            "Close": [102.0, 102.75], "Volume": [1000, 1000],
+        }, index=idx)
+        row = {"ticker": "NVDA", "horizon": "DAY", "created_at": "2026-09-21T14:07:00+00:00"}
+        with patch("portfolio.latest_regular", return_value=bars):
+            self.assertEqual(_day_session_exit_price(row, 99.0), 102.75)
 
     def test_scanner_watch_score(self):
         near = _opportunity_detail("WAIT", 0.62, 0.0045, 0.60, 0.0035, "NORMAL")
@@ -168,11 +224,36 @@ class CoreTests(unittest.TestCase):
             else:
                 os.environ["RADAR_TICKERS"] = old
 
+
+    def test_cloud_scheduler_recovery_wakeups_share_15m_slot(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from cloud_radar import _scheduler_slot_key
+        ny = ZoneInfo("America/New_York")
+        old = os.environ.get("GITHUB_EVENT_SCHEDULE")
+        try:
+            os.environ["GITHUB_EVENT_SCHEDULE"] = "2,7,12,17,22,27,32,37,42,47,52,57 4-15 * * 1-5"
+            keys = [
+                _scheduler_slot_key(datetime(2026, 9, 21, 10, 2, tzinfo=ny)),
+                _scheduler_slot_key(datetime(2026, 9, 21, 10, 7, tzinfo=ny)),
+                _scheduler_slot_key(datetime(2026, 9, 21, 10, 12, tzinfo=ny)),
+            ]
+            self.assertEqual(len(set(keys)), 1)
+            next_slot = _scheduler_slot_key(datetime(2026, 9, 21, 10, 17, tzinfo=ny))
+            self.assertNotEqual(keys[0], next_slot)
+        finally:
+            if old is None:
+                os.environ.pop("GITHUB_EVENT_SCHEDULE", None)
+            else:
+                os.environ["GITHUB_EVENT_SCHEDULE"] = old
+
     def test_cloud_radar_skips_when_market_not_live(self):
         from unittest.mock import patch
         from radar_engine import run_cloud_radar
         closed = {"status": "CLOSED", "is_pre": False, "is_open": False, "closed_reason": "WEEKEND"}
-        with patch("radar_engine.market_status", return_value=closed), patch("radar_engine.scanner") as scan_mock:
+        with patch("radar_engine.market_status", return_value=closed), \
+             patch("radar_engine.monitor_open_positions", return_value={"updated": 0, "closed": 0, "events": [], "errors": []}), \
+             patch("radar_engine.scanner") as scan_mock:
             out = run_cloud_radar(force_run=False, send_summary=False)
             self.assertEqual(out["scanned"], 0)
             scan_mock.assert_not_called()
@@ -180,7 +261,11 @@ class CoreTests(unittest.TestCase):
     def test_cloud_radar_confirmed_alert_path(self):
         from unittest.mock import patch
         from radar_engine import run_cloud_radar
-        live = {"status": "REGULAR SESSION", "is_pre": False, "is_open": True, "closed_reason": None}
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        live = {"status": "REGULAR SESSION", "is_pre": False, "is_open": True, "closed_reason": None,
+                "now": datetime(2026, 9, 21, 10, 0, tzinfo=ny)}
         frame = pd.DataFrame([{
             "ticker": "NVDA", "DAY": "PRE-BUY", "DAY_side": "BUY", "DAY_score": 88.0,
             "DAY_prob": 70.0, "DAY_exp": 0.8, "DAY_quality": 70.0, "DAY_reason": "ok",
@@ -195,14 +280,18 @@ class CoreTests(unittest.TestCase):
         }
         with patch("radar_engine.market_status", return_value=live), \
              patch("radar_engine.telegram_configured", return_value=True), \
+             patch("radar_engine.monitor_open_positions", return_value={"updated": 0, "closed": 0, "events": [], "errors": []}), \
+             patch("radar_engine._send_pending_exit_notifications", return_value=(0, 0, 0)), \
              patch("radar_engine.scanner", return_value=frame), \
              patch("radar_engine.analyze_day_fast", return_value=detail), \
+             patch("radar_engine.open_position_once", return_value=(7, True)), \
              patch("radar_engine.event_exists", return_value=False), \
              patch("radar_engine.send_telegram", return_value=True), \
              patch("radar_engine.record_event_once", return_value=True):
             out = run_cloud_radar(force_run=False, send_summary=False)
             self.assertEqual(out["sent"], 1)
             self.assertEqual(out["confirmed"], 1)
+            self.assertEqual(out["paper_opened"], 1)
 
 
 class DatabaseTests(unittest.TestCase):
@@ -246,6 +335,26 @@ class DatabaseTests(unittest.TestCase):
                 db.update_position_mark(pid, 105.0, 10.0)
                 db.close_position(pid, 106.0, 12.0, "MANUAL")
                 self.assertEqual(len(db.open_positions()), 0)
+                trade_stats = db.trade_metrics()
+                self.assertEqual(trade_stats["trades"], 1)
+                self.assertEqual(trade_stats["wins"], 1)
+                self.assertEqual(trade_stats["realized_pnl"], 12.0)
+                self.assertEqual(len(db.trade_events("ENTRY")), 1)
+                self.assertEqual(len(db.trade_events("EXIT")), 1)
+
+                auto_id, created = db.open_position_once("auto|NVDA|DAY|LONG", "NVDA", "DAY", "LONG", 1, 100.0, 98.0, 104.0, "auto")
+                self.assertTrue(created)
+                same_id, created_again = db.open_position_once("auto|NVDA|DAY|LONG", "NVDA", "DAY", "LONG", 1, 100.0, 98.0, 104.0, "auto")
+                self.assertFalse(created_again)
+                self.assertEqual(auto_id, same_id)
+
+                self.assertTrue(db.claim_radar_slot("slot-test", stale_minutes=1))
+                self.assertFalse(db.claim_radar_slot("slot-test", stale_minutes=1))
+                db.finish_radar_slot("slot-test", ok=False, error="retry")
+                self.assertTrue(db.claim_radar_slot("slot-test", stale_minutes=1))
+                db.finish_radar_slot("slot-test", ok=True)
+                self.assertFalse(db.claim_radar_slot("slot-test", stale_minutes=1))
+
                 ok = db.log_prediction_once(
                     event_key="test|NVDA|DAY", ticker="NVDA", horizon="DAY", signal="PRE-BUY",
                     p_up=0.7, p_down=0.3, expected_return=0.01, reference_price=100.0,

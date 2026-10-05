@@ -2,16 +2,17 @@ name: AI Market Decision - Cloud Radar
 
 on:
   schedule:
-    # Every 15 minutes, offset from the top of the hour to reduce scheduler congestion.
-    # 04:07-15:52 America/New_York covers US premarket + regular session.
-    - cron: '7,22,37,52 4-14 * * 1-5'
+    # Wake every 5 minutes, offset from round clock minutes. The persistent DB
+    # slot guard permits only one logical radar run per 15-minute slot, so the
+    # other wake-ups are recovery attempts rather than duplicate scans.
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 4-15 * * 1-5'
       timezone: 'America/New_York'
-    - cron: '7,22 15 * * 1-5'
+    - cron: '2,7,12 16 * * 1-5'
       timezone: 'America/New_York'
   workflow_dispatch:
     inputs:
       force_run:
-        description: 'Esegui anche fuori da premarket/sessione regolare'
+        description: 'Esegui diagnostica anche fuori da premarket/sessione regolare'
         required: false
         default: true
         type: boolean
@@ -37,9 +38,10 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      MARKET_DB_PATH: ${{ github.workspace }}/.radar_state/radar.db
       MODEL_CACHE_DIR: ${{ github.workspace }}/.radar_state/models
       RADAR_STATE_DIR: ${{ github.workspace }}/.radar_state
+      GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
+      RADAR_REQUIRE_PERSISTENT_DB: 'true'
       RADAR_TICKERS: ${{ vars.RADAR_TICKERS }}
       RADAR_ASSETS: ${{ vars.RADAR_ASSETS }}
       RADAR_WORKERS: ${{ vars.RADAR_WORKERS }}
@@ -63,34 +65,45 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements_worker.txt
 
-      - name: Restore radar state and trained DAY models
+      - name: Restore trained DAY models
         uses: actions/cache/restore@v4
         with:
-          path: .radar_state
-          key: radar-state-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .radar_state/models
+          key: radar-models-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            radar-state-${{ runner.os }}-
+            radar-models-${{ runner.os }}-
 
-      - name: Prepare persistent state directory
+      - name: Prepare model cache directory
         run: mkdir -p .radar_state/models
 
       - name: Install worker dependencies
         run: python -m pip install -r requirements_worker.txt
 
-      - name: Validate Telegram secrets
+      - name: Validate persistent cloud configuration
         shell: bash
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
             echo "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in GitHub repository secrets."
             exit 2
           fi
+          if [ -z "$DATABASE_URL" ]; then
+            echo "Missing DATABASE_URL. Cloud trade/scheduler state must use persistent PostgreSQL."
+            exit 4
+          fi
+          case "$DATABASE_URL" in
+            postgres://*|postgresql://*|postgresql+psycopg://*) ;;
+            *)
+              echo "DATABASE_URL must point to PostgreSQL for the cloud worker."
+              exit 4
+              ;;
+          esac
 
       - name: Run cloud radar
         run: python cloud_radar.py
 
-      - name: Save radar state and trained DAY models
+      - name: Save trained DAY models
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .radar_state
-          key: radar-state-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .radar_state/models
+          key: radar-models-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
