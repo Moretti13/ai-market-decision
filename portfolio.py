@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, List
 
-from data_layer import quote_snapshot, safe_float
+import pandas as pd
+
+from data_layer import latest_regular, quote_snapshot, safe_float
 from db import close_position_once, open_positions, update_position_mark
 from market_clock import market_status
 
@@ -42,6 +44,61 @@ def _day_position_is_stale(row, status: dict) -> bool:
         return False
 
 
+def _intraday_level_exit(row) -> tuple[str, float] | None:
+    """Detect a DAY stop/target touch on completed 5m bars after the paper entry.
+
+    The partial 5m bar containing the entry timestamp is skipped unless the entry
+    is exactly on a 5m boundary, avoiding a false trigger from price action that
+    happened before the paper trade existed. If stop and target are both touched
+    in one bar, STOP wins conservatively because OHLC cannot reveal hit order.
+    """
+    if str(row.get("horizon", "")).upper() != "DAY":
+        return None
+    stop = safe_float(row.get("stop"), 0.0)
+    target = safe_float(row.get("target"), 0.0)
+    if stop <= 0 and target <= 0:
+        return None
+    bars = latest_regular(str(row["ticker"]))
+    if bars is None or bars.empty:
+        return None
+
+    try:
+        created = pd.Timestamp(row.get("created_at"))
+        if created.tzinfo is None:
+            created = created.tz_localize("UTC")
+        else:
+            created = created.tz_convert("UTC")
+        start = created.ceil("5min")
+        idx = bars.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+            bars = bars.copy()
+            bars.index = idx
+        else:
+            start = start.tz_convert(idx.tz)
+        eligible = bars.loc[bars.index >= start]
+    except Exception:
+        return None
+
+    side = str(row.get("side", "")).upper()
+    for _, bar in eligible.iterrows():
+        high = safe_float(bar.get("High"), 0.0)
+        low = safe_float(bar.get("Low"), 0.0)
+        if high <= 0 or low <= 0:
+            continue
+        if side == "LONG":
+            stop_hit = stop > 0 and low <= stop
+            target_hit = target > 0 and high >= target
+        else:
+            stop_hit = stop > 0 and high >= stop
+            target_hit = target > 0 and low <= target
+        if stop_hit:
+            return "STOP", float(stop)
+        if target_hit:
+            return "TARGET", float(target)
+    return None
+
+
 def monitor_open_positions(auto_close_levels: bool = True, close_at_session_end: bool = True) -> Dict:
     positions = open_positions()
     events: List[Dict] = []
@@ -60,26 +117,35 @@ def monitor_open_positions(auto_close_levels: bool = True, close_at_session_end:
             updated += 1
 
             reason = None
+            exit_price = price
             side = str(row["side"]).upper()
             stop = safe_float(row.get("stop"), 0.0)
             target = safe_float(row.get("target"), 0.0)
-            if auto_close_levels and side == "LONG":
+
+            # DAY paper positions need touch detection, not only a 15-minute
+            # snapshot, otherwise a stop/target hit between worker cycles can
+            # disappear before the next mark.
+            level_touch = _intraday_level_exit(row) if auto_close_levels else None
+            if level_touch is not None:
+                reason, exit_price = level_touch
+            elif auto_close_levels and side == "LONG":
                 if stop > 0 and price <= stop:
-                    reason = "STOP"
+                    reason, exit_price = "STOP", price
                 elif target > 0 and price >= target:
-                    reason = "TARGET"
+                    reason, exit_price = "TARGET", price
             elif auto_close_levels and side == "SHORT":
                 if stop > 0 and price >= stop:
-                    reason = "STOP"
+                    reason, exit_price = "STOP", price
                 elif target > 0 and price <= target:
-                    reason = "TARGET"
+                    reason, exit_price = "TARGET", price
 
             if reason is None and close_at_session_end and str(row.get("horizon", "")).upper() == "DAY":
                 status = market_status(str(row["ticker"]))
                 if _day_position_is_stale(row, status):
-                    reason = "SESSION_END"
+                    reason, exit_price = "SESSION_END", price
 
-            if reason and close_position_once(int(row["id"]), price, pnl, reason):
+            exit_pnl = position_pnl(row["side"], int(row["quantity"]), float(row["entry"]), exit_price)
+            if reason and close_position_once(int(row["id"]), exit_price, exit_pnl, reason):
                 closed += 1
                 events.append({
                     "id": int(row["id"]),
@@ -88,8 +154,8 @@ def monitor_open_positions(auto_close_levels: bool = True, close_at_session_end:
                     "side": side,
                     "quantity": int(row["quantity"]),
                     "reason": reason,
-                    "price": price,
-                    "pnl": pnl,
+                    "price": exit_price,
+                    "pnl": exit_pnl,
                 })
         except Exception as exc:
             errors.append(f"{row.get('ticker')}: {exc}")
