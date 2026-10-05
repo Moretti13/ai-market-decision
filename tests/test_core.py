@@ -193,6 +193,25 @@ class CoreTests(unittest.TestCase):
             else:
                 os.environ["RADAR_TICKERS"] = old
 
+
+    def test_cloud_scheduler_primary_and_backup_share_slot(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from cloud_radar import _scheduler_slot_key
+        ny = ZoneInfo("America/New_York")
+        old = os.environ.get("GITHUB_EVENT_SCHEDULE")
+        try:
+            os.environ["GITHUB_EVENT_SCHEDULE"] = "7,22,37,52 4-15 * * 1-5"
+            primary = _scheduler_slot_key(datetime(2026, 9, 21, 10, 7, tzinfo=ny))
+            os.environ["GITHUB_EVENT_SCHEDULE"] = "12,27,42,57 4-15 * * 1-5"
+            backup = _scheduler_slot_key(datetime(2026, 9, 21, 10, 12, tzinfo=ny))
+            self.assertEqual(primary, backup)
+        finally:
+            if old is None:
+                os.environ.pop("GITHUB_EVENT_SCHEDULE", None)
+            else:
+                os.environ["GITHUB_EVENT_SCHEDULE"] = old
+
     def test_cloud_radar_skips_when_market_not_live(self):
         from unittest.mock import patch
         from radar_engine import run_cloud_radar
