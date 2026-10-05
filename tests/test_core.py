@@ -134,6 +134,14 @@ class CoreTests(unittest.TestCase):
         conflict = _opportunity_detail("WAIT", 0.65, -0.001, 0.50, 0.0035, "NORMAL")
         self.assertLess(conflict["score"], near["score"])
 
+    def test_radar_ledger_same_bar_is_conservative_stop(self):
+        from radar_ledger import _first_exit_from_bars
+        idx = pd.date_range("2026-09-29 14:00", periods=1, freq="5min", tz="UTC")
+        bars = pd.DataFrame({"High": [105.0], "Low": [95.0]}, index=idx)
+        price, reason, _ = _first_exit_from_bars("LONG", 98.0, 104.0, bars)
+        self.assertEqual(price, 98.0)
+        self.assertEqual(reason, "STOP_SAME_BAR")
+
     def test_model_and_backtest_helpers(self):
         rng = np.random.default_rng(7)
         n = 430
@@ -157,6 +165,32 @@ class CoreTests(unittest.TestCase):
         self.assertNotEqual(a, b)
         self.assertIn("NVDA", a)
 
+    def test_cloud_radar_empty_cutoff_uses_default(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from unittest.mock import patch
+        from radar_engine import run_cloud_radar
+
+        ny = ZoneInfo("America/New_York")
+        live = {
+            "status": "REGULAR SESSION", "is_pre": False, "is_open": True,
+            "closed_reason": None, "now": datetime(2026, 9, 29, 15, 35, tzinfo=ny),
+        }
+        old = os.environ.get("RADAR_ENTRY_CUTOFF_ET")
+        os.environ["RADAR_ENTRY_CUTOFF_ET"] = ""
+        try:
+            with patch("radar_engine.market_status", return_value=live), \
+                 patch("radar_engine.reconcile_open_positions", return_value={"checked": 0, "closed": [], "open": 0, "errors": []}), \
+                 patch("radar_engine.scanner") as scan_mock:
+                out = run_cloud_radar(force_run=False, send_summary=False)
+                self.assertIn("15:30", out.get("reason", ""))
+                scan_mock.assert_not_called()
+        finally:
+            if old is None:
+                os.environ.pop("RADAR_ENTRY_CUTOFF_ET", None)
+            else:
+                os.environ["RADAR_ENTRY_CUTOFF_ET"] = old
+
     def test_cloud_radar_custom_universe(self):
         old = os.environ.get("RADAR_TICKERS")
         os.environ["RADAR_TICKERS"] = "NVDA, AAPL, NVDA"
@@ -172,7 +206,9 @@ class CoreTests(unittest.TestCase):
         from unittest.mock import patch
         from radar_engine import run_cloud_radar
         closed = {"status": "CLOSED", "is_pre": False, "is_open": False, "closed_reason": "WEEKEND"}
-        with patch("radar_engine.market_status", return_value=closed), patch("radar_engine.scanner") as scan_mock:
+        with patch("radar_engine.market_status", return_value=closed), \
+             patch("radar_engine.reconcile_open_positions", return_value={"checked": 0, "closed": [], "open": 0, "errors": []}), \
+             patch("radar_engine.scanner") as scan_mock:
             out = run_cloud_radar(force_run=False, send_summary=False)
             self.assertEqual(out["scanned"], 0)
             scan_mock.assert_not_called()
@@ -199,7 +235,10 @@ class CoreTests(unittest.TestCase):
              patch("radar_engine.analyze_day_fast", return_value=detail), \
              patch("radar_engine.event_exists", return_value=False), \
              patch("radar_engine.send_telegram", return_value=True), \
-             patch("radar_engine.record_event_once", return_value=True):
+             patch("radar_engine.record_event_once", return_value=True), \
+             patch("radar_engine.reconcile_open_positions", return_value={"checked": 0, "closed": [], "open": 0, "errors": []}), \
+             patch("radar_engine.register_confirmed_trade", return_value={"opened": True, "reason": "OPENED", "position_id": 1}), \
+             patch("radar_engine.export_trade_ledger", return_value={"closed": 0, "open": 1, "net_pnl": 0.0}):
             out = run_cloud_radar(force_run=False, send_summary=False)
             self.assertEqual(out["sent"], 1)
             self.assertEqual(out["confirmed"], 1)
