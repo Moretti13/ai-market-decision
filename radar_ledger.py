@@ -12,7 +12,7 @@ import pandas as pd
 from alerts import send_telegram
 from config import DEFAULTS
 from data_layer import fetch, safe_float
-from db import all_positions, close_position, open_position, open_positions, recent_events, update_position_mark
+from db import all_positions, close_position, event_exists, open_position, open_positions, recent_events, record_event_once, update_position_mark
 
 NY = ZoneInfo("America/New_York")
 
@@ -266,5 +266,13 @@ def daily_summary_message(now_et: datetime | None = None) -> str:
 
 
 def send_daily_summary(now_et: datetime | None = None) -> bool:
+    now_et = now_et.astimezone(NY) if now_et else datetime.now(NY)
     export_trade_ledger()
-    return bool(send_telegram(daily_summary_message(now_et)))
+    key = f"V75|DAILY_SUMMARY|{now_et.date().isoformat()}"
+    if event_exists(key):
+        return True
+    message = daily_summary_message(now_et)
+    if not send_telegram(message):
+        return False
+    record_event_once(key, "RADAR", "DAY", "DAILY_SUMMARY", 0.0, 0.0, 0.0, notes="V7.5 automatic paper P/L summary")
+    return True
