@@ -135,7 +135,7 @@ def _exit_message(row: pd.Series) -> str:
     )
 
 
-def _send_pending_exit_notifications(limit: int = 100) -> tuple[int, int, int]:
+def _send_pending_exit_notifications(limit: int = 5000) -> tuple[int, int, int]:
     """Retry unsent EXIT notifications from the persistent trade ledger."""
     sent = failed = duplicates = 0
     df = trade_events("EXIT", limit=limit)
