@@ -19,6 +19,7 @@ from db import (
     prediction_metrics,
     recent_events,
     record_event_once,
+    trade_metrics,
 )
 from market_clock import market_status
 from model_engine import clear_model_cache, walk_forward_backtest
@@ -473,19 +474,28 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Paper Position Tracker")
-    st.caption("Per ridurre chiamate dati/CPU, il monitor paper non interroga i prezzi ad ogni rerun della pagina. Aggiornalo quando vuoi controllare stop/target.")
+    st.caption("Il worker cloud gestisce automaticamente stop/target/fine sessione. Questo pulsante forza un controllo immediato dalla dashboard.")
     if st.button("🔄 Aggiorna posizioni paper / stop-target", key="refresh_paper_positions"):
         monitor = monitor_open_positions(auto_close_levels=True)
         st.session_state["paper_monitor"] = monitor
         for ev in monitor.get("events", []):
-            key = f"V73|POSITION|{ev['id']}|{ev['reason']}"
-            if record_event_once(key, ev["ticker"], "POSITION", ev["reason"], ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}"):
-                send_telegram(f"AI Market Decision V7.4\n{ev['ticker']} PAPER POSITION\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:.2f}")
+            key = f"V74|TRADE_NOTIFY|POSITION|{ev['id']}|EXIT"
+            if not event_exists(key):
+                message = f"AI Market Decision V7.4\n{ev['ticker']} PAPER EXIT\n{ev['reason']}\nPrice {ev['price']:.2f}\nPnL {ev['pnl']:+.2f}"
+                if send_telegram(message):
+                    record_event_once(key, ev["ticker"], "POSITION", f"EXIT {ev['reason']}", ev["price"], 0, 0, notes=f"PnL {ev['pnl']:.2f}")
     monitor = st.session_state.get("paper_monitor", {"updated": 0, "closed": 0, "events": [], "errors": []})
     if monitor.get("updated") or monitor.get("closed"):
         st.info(f"Paper tracker: aggiornate {monitor.get('updated', 0)} · chiuse {monitor.get('closed', 0)}")
     if monitor.get("errors"):
         st.warning(monitor["errors"])
+
+    paper_metrics = trade_metrics()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("P/L realizzato", f"{paper_metrics.get('realized_pnl', 0.0):+.2f}")
+    m2.metric("Win rate", pct(paper_metrics.get("win_rate", 0.0)))
+    m3.metric("Max drawdown", f"{paper_metrics.get('max_drawdown', 0.0):.2f}")
+    m4.metric("Trade chiusi", int(paper_metrics.get("trades", 0)))
 
     st.markdown("#### Apri dal piano DAY corrente")
     plan = st.session_state["analysis"].get("plan", {})
