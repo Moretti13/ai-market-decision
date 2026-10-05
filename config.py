@@ -2,7 +2,7 @@ from __future__ import annotations
 
 APP_NAME = "AI Market Decision V7.4.1 Cloud Radar"
 APP_VERSION = "7.4.1"
-APP_BUILD = "V7.4.1-TELEGRAM-HOTFIX"
+APP_BUILD = "V7.4.1-CLOUD-PAPER-AUTOMATION"
 
 US_STOCKS = [
     "NVDA", "AMD", "AVGO", "MSFT", "AMZN", "META", "GOOGL", "AAPL", "TSLA", "NFLX",
