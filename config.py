@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-APP_NAME = "AI Market Decision V7.4.1 Cloud Radar"
-APP_VERSION = "7.4.1"
-APP_BUILD = "V7.4.1-TELEGRAM-HOTFIX"
+APP_NAME = "AI Market Decision V7.5 Reliability"
+APP_VERSION = "7.5"
+APP_BUILD = "V7.5-RELIABILITY"
 
 US_STOCKS = [
     "NVDA", "AMD", "AVGO", "MSFT", "AMZN", "META", "GOOGL", "AAPL", "TSLA", "NFLX",
@@ -41,6 +41,10 @@ DEFAULTS = {
     "scanner_watch_score": 60.0,
     "scanner_alert_score": 75.0,
     "radar_interval_minutes": 15,
+    "radar_daemon_interval_minutes": 15,
+    "radar_daemon_premarket_end": "09:27",
+    "radar_daemon_regular_end": "15:22",
+    "radar_eod_summary_time": "16:05",
     "radar_assets": 5,
     "radar_confirm_floor": 60.0,
     "radar_max_alerts": 3,
