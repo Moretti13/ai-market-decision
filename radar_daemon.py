@@ -90,6 +90,12 @@ def run_window() -> int:
     now_et = datetime.now(NY)
     clock = market_status("SPY", now_et)
 
+    if not clock.get("is_session_day", False):
+        # Holiday/weekend: one lightweight reconciliation and exit. Do not keep
+        # a GitHub runner sleeping for hours on a closed-market day.
+        run_once(force_run=False, send_summary=False)
+        return 0
+
     # Dedicated post-close cycle: reconcile any remaining DAY paper positions,
     # export the ledger and send one daily P/L summary.
     if clock.get("is_post") or now_et.timetz().replace(tzinfo=None) >= time(16, 0):
