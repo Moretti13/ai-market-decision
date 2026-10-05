@@ -2,16 +2,12 @@ name: AI Market Decision - Cloud Radar
 
 on:
   schedule:
-    # Primary + backup trigger for each logical 15-minute slot.
-    # The database slot guard lets the backup recover a failed/delayed primary
-    # without running the scanner twice.
-    - cron: '7,22,37,52 4-15 * * 1-5'
+    # Wake every 5 minutes, offset from round clock minutes. The persistent DB
+    # slot guard permits only one logical radar run per 15-minute slot, so the
+    # other wake-ups are recovery attempts rather than duplicate scans.
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 4-15 * * 1-5'
       timezone: 'America/New_York'
-    - cron: '12,27,42,57 4-15 * * 1-5'
-      timezone: 'America/New_York'
-    - cron: '7 16 * * 1-5'
-      timezone: 'America/New_York'
-    - cron: '12 16 * * 1-5'
+    - cron: '2,7,12 16 * * 1-5'
       timezone: 'America/New_York'
   workflow_dispatch:
     inputs:
