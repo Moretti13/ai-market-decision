@@ -12,6 +12,7 @@ from db import event_exists, record_event_once
 from market_clock import market_status
 from scanner import scanner
 from signal_engine import analyze_day_fast
+from radar_ledger import export_trade_ledger, reconcile_open_positions, register_confirmed_trade
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -30,11 +31,19 @@ def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 500) -> i
 
 
 def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.getenv(name)
     try:
-        value = float(os.getenv(name, str(default)))
+        value = float(raw) if raw is not None and str(raw).strip() != "" else float(default)
     except Exception:
         value = float(default)
     return max(minimum, min(maximum, value))
+
+
+def _env_text(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return str(default)
+    return str(raw).strip()
 
 
 def configured_universe() -> list[str]:
@@ -49,7 +58,7 @@ def _event_key(ticker: str, state: str, side: str = "") -> str:
     # One notification per state/side/ticker/session day. A later transition from
     # WATCH to ENTRY CONFIRMED is a different key and therefore can notify again.
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"V74|CLOUD|{day}|DAY|{ticker.upper()}|{state.upper()}|{side.upper()}"
+    return f"V75|CLOUD|{day}|DAY|{ticker.upper()}|{state.upper()}|{side.upper()}"
 
 
 def _fmt_price(value) -> str:
@@ -72,7 +81,7 @@ def _send_once(event_key: str, ticker: str, signal: str, message: str, *, entry=
 
 def _watch_message(row: pd.Series, state: str) -> str:
     return (
-        "📡 AI Market Decision V7.4 CLOUD RADAR\n"
+        "📡 AI Market Decision V7.5 CLOUD RADAR\n"
         f"{row.get('ticker', '')} · DAY · {state}\n"
         f"Opportunity score: {float(row.get('DAY_score', 0.0)):.1f}/100\n"
         f"P(up): {float(row.get('DAY_prob', 50.0)):.1f}%\n"
@@ -91,7 +100,7 @@ def _confirmed_message(detail: dict, score: float) -> str:
     pre = detail.get("pre", {})
     events = detail.get("events", {})
     return (
-        "✅ AI Market Decision V7.4 — ENTRY CONFIRMED\n"
+        "✅ AI Market Decision V7.5 — ENTRY CONFIRMED\n"
         f"{detail.get('ticker', '')} · DAY · {confirm.get('signal', '')}\n"
         f"Opportunity score: {score:.1f}/100\n"
         f"P(up): {float(pre.get('p_up', 0.5))*100:.1f}%\n"
@@ -116,6 +125,15 @@ def run_cloud_radar(*, force_run: bool = False, send_summary: bool = False) -> d
     """
     clock = market_status("SPY")
     live = bool(clock.get("is_pre") or clock.get("is_open"))
+
+    # Always reconcile previously confirmed paper trades first. This means a
+    # post-close run can register STOP/TARGET/EOD outcomes even though no new
+    # DAY entries are allowed.
+    try:
+        ledger = reconcile_open_positions(notify=True)
+    except Exception as exc:
+        ledger = {"checked": 0, "closed": [], "open": 0, "errors": [f"ledger: {exc}"]}
+
     result = {
         "status": clock.get("status", "UNKNOWN"),
         "live": live,
@@ -126,7 +144,10 @@ def run_cloud_radar(*, force_run: bool = False, send_summary: bool = False) -> d
         "failed": 0,
         "confirmed": 0,
         "watch": 0,
-        "errors": [],
+        "paper_checked": int(ledger.get("checked", 0) or 0),
+        "paper_closed": int(len(ledger.get("closed", []) or [])),
+        "paper_open": int(ledger.get("open", 0) or 0),
+        "errors": list(ledger.get("errors", []) or []),
     }
     if not live and not force_run:
         result["reason"] = f"Mercato non live: {clock.get('status', 'CLOSED')} / {clock.get('closed_reason') or ''}".strip()
@@ -135,7 +156,7 @@ def run_cloud_radar(*, force_run: bool = False, send_summary: bool = False) -> d
     # Avoid opening new DAY trades too close to the US cash close. The default
     # cutoff is 15:30 ET and can be changed with RADAR_ENTRY_CUTOFF_ET=HH:MM.
     if live and clock.get("is_open") and not force_run:
-        cutoff_raw = os.getenv("RADAR_ENTRY_CUTOFF_ET", str(DEFAULTS.get("radar_entry_cutoff_et", "15:30")))
+        cutoff_raw = _env_text("RADAR_ENTRY_CUTOFF_ET", str(DEFAULTS.get("radar_entry_cutoff_et", "15:30")))
         try:
             hh, mm = [int(x) for x in cutoff_raw.split(":", 1)]
             now_local = clock.get("now")
@@ -186,10 +207,19 @@ def run_cloud_radar(*, force_run: bool = False, send_summary: bool = False) -> d
             if allow_candidate_alerts and confirm.get("status") == "CONFIRMED" and plan.get("status") == "READY":
                 side = str(plan.get("side") or confirm.get("signal") or "")
                 key = _event_key(ticker, "ENTRY_CONFIRMED", side)
+
+                # Register the paper trade independently from Telegram delivery.
+                # That way the performance sample is not lost if Telegram has a
+                # temporary outage.
+                trade_reg = register_confirmed_trade(detail, key, score)
+                if trade_reg.get("opened"):
+                    result.setdefault("paper_opened", 0)
+                    result["paper_opened"] += 1
+
                 status = _send_once(
                     key, ticker, str(confirm.get("signal", "ENTRY CONFIRMED")), _confirmed_message(detail, score),
                     entry=plan.get("entry"), stop=plan.get("stop"), target=plan.get("target"),
-                    notes=f"Cloud Radar confirmed; score {score:.1f}",
+                    notes=f"Cloud Radar V7.5 confirmed; score {score:.1f}; paper={trade_reg.get('reason')}",
                 )
                 if status == "sent":
                     result["sent"] += 1
@@ -221,12 +251,18 @@ def run_cloud_radar(*, force_run: bool = False, send_summary: bool = False) -> d
         except Exception as exc:
             result["errors"].append(f"{ticker}: {exc}")
 
+    # Persist a machine-readable ledger snapshot after every cycle.
+    try:
+        result["paper_metrics"] = export_trade_ledger()
+    except Exception as exc:
+        result["errors"].append(f"ledger export: {exc}")
+
     result["summary_requested"] = bool(send_summary)
     result["summary_sent"] = False
     if send_summary:
         top = df.head(min(3, len(df)))
         lines = [
-            "🧪 AI Market Decision V7.4.1 — Cloud Radar test",
+            "🧪 AI Market Decision V7.5 — Cloud Radar test",
             f"Mercato: {clock.get('status', 'UNKNOWN')}",
             f"Asset analizzati: {result['scanned']}",
             f"Alert inviati: {result['sent']} (confirmed {result['confirmed']}, watch {result['watch']})",
