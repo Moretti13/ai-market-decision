@@ -1,0 +1,27 @@
+name: V7.5 Reliability CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements_worker.txt
+      - name: Install
+        run: python -m pip install -r requirements_worker.txt
+      - name: Compile
+        run: python -m py_compile config.py db.py radar_engine.py radar_ledger.py radar_daemon.py cloud_radar.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
