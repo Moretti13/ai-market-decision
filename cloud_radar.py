@@ -21,7 +21,7 @@ def _bool(name: str, default: bool = False) -> bool:
 
 
 def _scheduler_slot_key(now: datetime | None = None) -> str:
-    """Map primary/backup cron invocations to the same logical 15-minute ET slot."""
+    """Map redundant 5-minute wake-ups to one logical 15-minute ET slot."""
     now_et = (now or datetime.now(NY)).astimezone(NY)
     expr = str(os.getenv("GITHUB_EVENT_SCHEDULE", "") or "").strip()
     offset = 0
@@ -67,7 +67,7 @@ def main() -> int:
             print(json.dumps({
                 "status": "SKIPPED_DUPLICATE_SLOT",
                 "slot_key": slot_key,
-                "reason": "slot gia completato o primario ancora attivo",
+                "reason": "slot gia completato o un tentativo e ancora attivo",
             }, ensure_ascii=False))
             return 0
 
@@ -84,7 +84,7 @@ def main() -> int:
             print("Telegram test summary was requested but was not delivered.")
             code = 3
         elif result.get("failed", 0) or result.get("exit_failed", 0):
-            # Mark the slot failed so the backup trigger can retry unsent ENTRY/WATCH/EXIT alerts.
+            # Mark the slot failed so a later recovery wake-up can retry unsent ENTRY/WATCH/EXIT alerts.
             code = 2
         elif result.get("errors") and result.get("scanned", 0) == 0 and not result.get("positions_updated", 0):
             code = 2
